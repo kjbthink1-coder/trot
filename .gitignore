@@ -1,0 +1,47 @@
+﻿# Virtual Environment & Python cache
+__pycache__/
+*.py[cod]
+*.class
+*.env
+.env.local
+.venv
+venv/
+ENV/
+
+# OS specific
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+
+# Temporary outputs & renders
+outputs/temp_render/
+outputs/crawled/
+outputs/videos/
+outputs/audio/
+outputs/thumbnails/
+outputs/
+*.mp4
+*.mp3
+*.wav
+
+# SQLite DB & temp test files
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+scratch/
+backup_baseline_*/
+
+# Temp test files in root
+test_*.mp4
+test_*.mp3
+test_*.srt
+test_*.jpg
+face_test_*.jpg
+face_aware_test.jpg
+
+# IDE / Editor
+.vscode/
+.idea/
+.agents/
