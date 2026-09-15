@@ -15,10 +15,11 @@ BLOG_MIN_CHARS: int = int(BLOG_TARGET_CHARS * (1.0 - BLOG_TOLERANCE_RATIO))  # 2
 BLOG_MAX_CHARS: int = int(BLOG_TARGET_CHARS * (1.0 + BLOG_TOLERANCE_RATIO))  # 2,640
 
 ONE_SHOT_PROMPT_TEMPLATE = """당신은 수백만 조회수를 기록하는 유튜브 트로트 전문 채널('영웅대학', '서진대학')의 메인 스토리텔러 작가이자 네이버 1등 트로트 전문 블로그 '트롯매거진'의 수석 에디터입니다.
-제공된 트로트 뉴스 기사를 분석하여 5070 시니어 여성 팬덤이 열광하는 (1) 60초 쇼츠 대본, (2) 2줄 썸네일 카피 5종, (3) 2,400자 4단 블로그 원고를 아래 JSON 형식으로 한 번에 생성하세요.
+제공된 트로트 뉴스 기사를 분석하여 5070 시니어 여성 팬덤이 열광하는 (1) 기사의 진짜 주인공 가수 이름, (2) 60초 쇼츠 대본, (3) 2줄 썸네일 카피 5종, (4) 2,400자 4단 블로그 원고를 아래 JSON 형식으로 한 번에 생성하세요.
 
 [필수 JSON 규격]
 {
+  "target_singer": "기사 문맥상의 핵심 주인공 가수 이름 (예: 조항조, 임영웅, 박서진 등 1개 단어)",
   "shorts_script": "50~60초 분량의 나레이션 대본 (한글 공백포함 400~500자 엄수). 0~5초 오프닝 3초 후킹(정답을 미리 말하지 않고 결론 은닉형 질문으로 시작) -> 가수의 평소 인품/미담 빌드업 -> 본론 사건과 네티즌들의 감동 댓글/전문가 평가 인용 -> 훈훈한 감동 마무리. 특수기호나 효과음 지문 없이 성우가 바로 읽을 나레이션 본문만 작성할 것.",
   "thumbnails": [
     {"line1": "윗줄 카피 1", "line2": "아랫줄 카피 1!!"},
@@ -79,6 +80,7 @@ def generate_contents(article_title: str, article_content: str, singer_name: str
                     )
                     data = json.loads(res.text)
                     return {
+                        "target_singer": data.get("target_singer", singer_name),
                         "shorts_script": data.get("shorts_script", ""),
                         "thumbnails": data.get("thumbnails", _fallback_thumbnails(singer_name, article_title)),
                         "blog_post": data.get("blog_post", ""),
@@ -107,6 +109,7 @@ def generate_contents(article_title: str, article_content: str, singer_name: str
             )
             data = json.loads(res.choices[0].message.content)
             return {
+                "target_singer": data.get("target_singer", singer_name),
                 "shorts_script": data.get("shorts_script", ""),
                 "thumbnails": data.get("thumbnails", _fallback_thumbnails(singer_name, article_title)),
                 "blog_post": data.get("blog_post", ""),
@@ -197,6 +200,7 @@ def _generate_fallback(title: str, content: str, singer: str) -> dict:
 """
 
     return {
+        "target_singer": singer,
         "shorts_script": shorts_script,
         "thumbnails": thumbnails,
         "blog_post": blog_post

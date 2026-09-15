@@ -165,46 +165,39 @@ def parse_naver_news(
 
     clean_content = '\n\n'.join(cleaned_lines)
 
-    # 4. 가수명 감지 (제목 및 본문 전체에서 정밀 매칭)
+    # 4. 가수명 감지 (제목 및 본문 빈도수 기반 정밀 스코어링)
     detected_singer = "트로트 스타"
     known_singers = [
-        "이찬원", "박서진", "임영웅", "김용빈", "박지현", "영탁", 
+        "조항조", "이찬원", "박서진", "임영웅", "김용빈", "박지현", "영탁", 
         "송가인", "양지은", "진해성", "진혜성", "홍지윤", "정동원", 
         "장민호", "손태진", "안성훈", "전유진", "김태연", "김다현", 
         "오유진", "마이진", "강혜연", "은가은", "나상도", "최수호", 
         "진욱", "박성온", "황민호", "황영웅", "신성", "에녹", 
         "민수현", "김희재", "남승민", "홍자", "정미애", "숙행", 
         "김소연", "배아현", "정서주", "미스김", "나훈아", "남진", 
-        "장윤정", "주현미"
+        "장윤정", "주현미", "현철", "설운도", "태진아", "송대관",
+        "김연자", "김용임", "진성", "박구윤", "신유", "강진",
+        "배일호", "윤수현", "최진희", "정수라", "이은하", "김수희",
+        "심수봉", "혜은이", "노사연", "김범룡", "전영록", "조용필"
     ]
     
-    # 1순위: 제목에서 탐색
+    # 제목 가중치(10점) + 본문 언급 횟수(1점)로 최다 언급 주인공 산출
+    singer_scores = {}
     for singer in known_singers:
-        if singer in title:
-            detected_singer = singer
-            break
-            
-    # 2순위: 본문 상단(500자)에서 탐색
-    if detected_singer == "트로트 스타":
-        for singer in known_singers:
-            if singer in clean_content[:500]:
-                detected_singer = singer
-                break
+        t_count = title.count(singer)
+        c_count = clean_content.count(singer)
+        if t_count > 0 or c_count > 0:
+            singer_scores[singer] = (t_count * 10) + c_count
 
-    # 3순위: 본문 전체에서 탐색
-    if detected_singer == "트로트 스타":
-        for singer in known_singers:
-            if singer in clean_content:
-                detected_singer = singer
-                break
-
-    # 4순위: 동적 패턴 매칭 ('가수 OOO' 또는 'OOO 가수', 'OOO 씨')
-    if detected_singer == "트로트 스타":
-        m_singer = re.search(r'가수\s+([가-힣]{2,4})', title + " " + clean_content[:300])
+    if singer_scores:
+        detected_singer = max(singer_scores, key=singer_scores.get)
+    else:
+        # 동적 패턴 매칭 ('가수 OOO' 또는 'OOO 가수')
+        m_singer = re.search(r'가수\s+([가-힣]{2,4})', title + " " + clean_content[:500])
         if m_singer:
             detected_singer = m_singer.group(1).strip()
         else:
-            m_singer2 = re.search(r'([가-힣]{2,4})\s+가수', title + " " + clean_content[:300])
+            m_singer2 = re.search(r'([가-힣]{2,4})\s+가수', title + " " + clean_content[:500])
             if m_singer2:
                 detected_singer = m_singer2.group(1).strip()
 

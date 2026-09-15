@@ -228,6 +228,33 @@ def compute_file_hash(file_path: str) -> str:
     return hasher.hexdigest()
 
 
+def update_media_file_hash(file_path: str, db_path: Optional[str] = None) -> bool:
+    """Updates file_hash and dhash in database when a file is edited or cropped."""
+    norm_path = os.path.abspath(os.path.normpath(file_path))
+    if not os.path.isfile(norm_path):
+        return False
+    
+    new_hash = compute_file_hash(norm_path)
+    new_dhash = None
+    try:
+        new_dhash = compute_dhash(norm_path)
+    except Exception:
+        pass
+        
+    target_db = os.path.abspath(db_path or DEFAULT_DB_PATH)
+    try:
+        with get_db_connection(target_db) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE media SET file_hash = ?, dhash = ? WHERE file_path = ?",
+                (new_hash, new_dhash, norm_path)
+            )
+            return cur.rowcount > 0
+    except Exception as e:
+        logger.warning(f"Could not update media file hash for {norm_path}: {e}")
+        return False
+
+
 def compute_dhash(image_path: str) -> str:
     """
     Computes a 64-bit difference hash (dHash) for an image.
