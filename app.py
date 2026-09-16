@@ -558,16 +558,31 @@ with main_tab_produce:
             st.markdown(f"##### 🎬 [{parsed['singer']}] YouTube Creative Commons(CC) 영상 수집 및 3~4초 컷편집 스튜디오")
             st.caption("가수의 실제 영상 컷(3~4초)을 직접 미리보고 자른 후 가수 미디어 라이브러리에 저장·재사용합니다 (일반 B-roll과 엄격히 분리).")
 
-            # 1. DB FIRST: 가수의 기존 축적된 singer_cc_video DB 목록 표시
+            # 1. DB FIRST: 가수의 기존 축적된 singer_cc_video DB 목록 표시 및 사용자 직접 선택
+            if "selected_cc_clips" not in st.session_state:
+                st.session_state.selected_cc_clips = {}
+
             singer_cc_db_clips = get_db_singer_cc_clips(parsed['singer'], limit=10)
             if singer_cc_db_clips:
-                st.markdown(f"🗄️ **가수 라이브러리 DB 보유 클립 ({len(singer_cc_db_clips)}개)**")
+                st.markdown(f"🗄️ **가수 라이브러리 DB 보유 클립 ({len(singer_cc_db_clips)}개)** — *오늘 쇼츠에 사용할 클립을 직접 체크(선택)하세요!*")
                 cols_cc_db = st.columns(min(4, len(singer_cc_db_clips)))
                 for c_idx, c_info in enumerate(singer_cc_db_clips):
-                    with cols_cc_db[c_idx % 4]:
-                        st.caption(f"📹 {c_info.get('video_title', 'CC Clip')[:20]}... ({c_info.get('clip_duration', 3.5):.1f}초)")
-                        if os.path.exists(c_info['file_path']):
-                            st.video(c_info['file_path'])
+                    fpath = c_info['file_path']
+                    if os.path.exists(fpath):
+                        with cols_cc_db[c_idx % 4]:
+                            st.caption(f"📹 {c_info.get('video_title', 'CC Clip')[:18]}... ({c_info.get('clip_duration', 3.5):.1f}초)")
+                            st.video(fpath)
+                            chk_key = f"chk_cc_{c_info.get('id', c_idx)}"
+                            is_checked = st.checkbox("✅ 오늘 쇼츠에 사용", value=True, key=chk_key)
+                            
+                            cur_singer_sel = st.session_state.selected_cc_clips.get(parsed['singer'], [])
+                            if is_checked:
+                                if fpath not in cur_singer_sel:
+                                    cur_singer_sel.append(fpath)
+                            else:
+                                if fpath in cur_singer_sel:
+                                    cur_singer_sel.remove(fpath)
+                            st.session_state.selected_cc_clips[parsed['singer']] = cur_singer_sel
 
             col_cc_btn, col_cc_info = st.columns([1.5, 3])
             with col_cc_btn:
@@ -791,11 +806,16 @@ with main_tab_produce:
                             else:
                                 video_imgs = all_imgs
 
-                            # CC 영상 클립 DB FIRST 탐색 (요청 수량만큼 추출)
+                            # CC 영상 클립 탐색 (사용자 체크박스 직접 선택 클립 1순위 -> DB 순서 순)
                             cc_file_paths = []
                             if num_cc_count > 0:
-                                db_cc = get_db_singer_cc_clips(singer_name, limit=num_cc_count * 2)
-                                cc_file_paths = [c["file_path"] for c in db_cc if os.path.exists(c.get("file_path", ""))][:num_cc_count]
+                                user_chosen = st.session_state.get("selected_cc_clips", {}).get(singer_name, [])
+                                user_chosen_valid = [p for p in user_chosen if os.path.exists(p)]
+                                if user_chosen_valid:
+                                    cc_file_paths = user_chosen_valid[:num_cc_count]
+                                else:
+                                    db_cc = get_db_singer_cc_clips(singer_name, limit=num_cc_count * 2)
+                                    cc_file_paths = [c["file_path"] for c in db_cc if os.path.exists(c.get("file_path", ""))][:num_cc_count]
 
                             proj_id = f"shorts_{singer_name}_{int(time.time())}"
                             try:
