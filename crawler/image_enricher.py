@@ -249,6 +249,245 @@ def _crawl_external_singer_photos(
     return downloaded
 
 
+# 한국 주요 트롯 가수별 공식 인스타그램 및 소속사 매핑 DB
+OFFICIAL_SINGER_MAP = {
+    "임영웅": {
+        "instagram": "limyoungwoong.official",
+        "agency": "물고기뮤직",
+        "keywords": ["limyoungwoong.official", "물고기뮤직", "공식 포스트"]
+    },
+    "박서진": {
+        "instagram": "parkseojin_official",
+        "agency": "포켓돌스튜디오",
+        "keywords": ["parkseojin_official", "포켓돌스튜디오", "공식 포스트"]
+    },
+    "김용빈": {
+        "instagram": "yongbin_official",
+        "agency": "김용빈 공식",
+        "keywords": ["yongbin_official", "공식 포스트"]
+    },
+    "이찬원": {
+        "instagram": "mee_woon_sani",
+        "agency": "스카이이엔엠",
+        "keywords": ["mee_woon_sani", "공식 포스트"]
+    },
+    "박지현": {
+        "instagram": "pjihyun_official",
+        "agency": "TN엔터테인먼트",
+        "keywords": ["pjihyun_official", "공식 포스트"]
+    },
+    "전유진": {
+        "instagram": "jeonyujin_official",
+        "agency": "전유진 공식",
+        "keywords": ["jeonyujin_official", "공식 포스트"]
+    }
+}
+
+# 수집된 사진별 출처 메타데이터 세션 매핑 (file_path -> source_type)
+PHOTO_SOURCE_MAP: Dict[str, str] = {}
+
+
+def get_photo_source_type(file_path: str) -> str:
+    """사진 파일 경로의 수집 출처 구분(official_instagram, official_agency, official_press, media_db, web_fallback)을 반환합니다."""
+    abs_p = os.path.abspath(os.path.normpath(file_path))
+    return PHOTO_SOURCE_MAP.get(abs_p, "web_fallback")
+
+
+def get_photo_source_badge(file_path: str) -> str:
+    """사진 출처 구분값에 따른 UI 출처 배지 HTML/텍스트를 반환합니다."""
+    stype = get_photo_source_type(file_path)
+    if stype == "official_instagram":
+        return "📸 공식 인스타"
+    elif stype == "official_agency":
+        return "🏢 소속사 공식"
+    elif stype == "official_press":
+        return "📰 공식 보도자료"
+    elif stype == "media_db":
+        return "🗄️ DB 보관"
+    else:
+        return "🌐 웹 검색"
+
+
+def search_instagram_official_photos(
+    singer_name: str,
+    target_count: int = 10,
+    output_dir: str = "outputs/crawled",
+    existing_paths: Optional[set] = None
+) -> List[str]:
+    """1순위: 가수의 공식 인스타그램 및 공식 SNS 고화질 원본 컷을 수집합니다."""
+    if target_count <= 0:
+        return []
+    os.makedirs(output_dir, exist_ok=True)
+    existing_paths = existing_paths or set()
+
+    handle_info = OFFICIAL_SINGER_MAP.get(singer_name, {})
+    insta_handle = handle_info.get("instagram", f"{singer_name}_official")
+
+    queries = [
+        f"site:instagram.com {singer_name} 공식",
+        f"site:instagram.com/{insta_handle}",
+        f"site:instagram.com {singer_name} 콘서트 화보"
+    ]
+
+    img_urls = []
+    for q in queries:
+        try:
+            d_url = f"https://search.daum.net/search?w=img&q={quote(q)}"
+            d_req = urllib.request.Request(d_url, headers=HEADERS)
+            d_html = urllib.request.urlopen(d_req, context=SSL_CTX, timeout=6).read().decode('utf-8', errors='ignore')
+            matches = re.findall(r'https?://[a-zA-Z0-9_./-]+\.(?:jpg|jpeg|png)', d_html)
+            for m in matches:
+                if any(k in m for k in ['cdninstagram', 'instagram', 'fbcdn', 'daumcdn', 'kakaocdn']) and m not in img_urls:
+                    img_urls.append(m)
+        except Exception:
+            pass
+
+    downloaded = []
+    for idx, u in enumerate(img_urls):
+        if len(downloaded) >= target_count:
+            break
+        fn = f"insta_{singer_name}_{idx+1}.jpg"
+        fp = os.path.abspath(os.path.join(output_dir, fn))
+        if fp in existing_paths:
+            continue
+        try:
+            req = urllib.request.Request(u, headers=HEADERS)
+            data = urllib.request.urlopen(req, context=SSL_CTX, timeout=5).read()
+            if len(data) > 10000:
+                with open(fp, "wb") as f:
+                    f.write(data)
+                if is_valid_photo(fp, min_w=300, min_h=250):
+                    downloaded.append(fp)
+                    PHOTO_SOURCE_MAP[fp] = "official_instagram"
+                else:
+                    if os.path.exists(fp):
+                        os.remove(fp)
+        except Exception:
+            pass
+
+    logger.info(f"[Stage 1/5] 공식 인스타그램/SNS에서 '{singer_name}' 고화질 사진 {len(downloaded)}장 수집 완료.")
+    return downloaded
+
+
+def search_agency_official_photos(
+    singer_name: str,
+    target_count: int = 10,
+    output_dir: str = "outputs/crawled",
+    existing_paths: Optional[set] = None
+) -> List[str]:
+    """2순위: 소속사 공식 네이버 포스트 / 카카오 채널 비하인드 원본 화보 컷을 수집합니다."""
+    if target_count <= 0:
+        return []
+    os.makedirs(output_dir, exist_ok=True)
+    existing_paths = existing_paths or set()
+
+    handle_info = OFFICIAL_SINGER_MAP.get(singer_name, {})
+    agency_name = handle_info.get("agency", "")
+
+    queries = [
+        f"site:post.naver.com {singer_name} {agency_name} 공식",
+        f"site:post.naver.com {singer_name} 비하인드 화보",
+        f"{singer_name} 소속사 공식 화보"
+    ]
+
+    img_urls = []
+    for q in queries:
+        try:
+            d_url = f"https://search.daum.net/search?w=img&q={quote(q)}"
+            d_req = urllib.request.Request(d_url, headers=HEADERS)
+            d_html = urllib.request.urlopen(d_req, context=SSL_CTX, timeout=6).read().decode('utf-8', errors='ignore')
+            matches = re.findall(r'https?://[a-zA-Z0-9_./-]+\.(?:jpg|jpeg|png)', d_html)
+            for m in matches:
+                if any(k in m for k in ['post-phinf', 'naver', 'daumcdn', 'kakaocdn']) and m not in img_urls:
+                    img_urls.append(m)
+        except Exception:
+            pass
+
+    downloaded = []
+    for idx, u in enumerate(img_urls):
+        if len(downloaded) >= target_count:
+            break
+        fn = f"agency_{singer_name}_{idx+1}.jpg"
+        fp = os.path.abspath(os.path.join(output_dir, fn))
+        if fp in existing_paths:
+            continue
+        try:
+            req = urllib.request.Request(u, headers=HEADERS)
+            data = urllib.request.urlopen(req, context=SSL_CTX, timeout=5).read()
+            if len(data) > 10000:
+                with open(fp, "wb") as f:
+                    f.write(data)
+                if is_valid_photo(fp, min_w=300, min_h=250):
+                    downloaded.append(fp)
+                    PHOTO_SOURCE_MAP[fp] = "official_agency"
+                else:
+                    if os.path.exists(fp):
+                        os.remove(fp)
+        except Exception:
+            pass
+
+    logger.info(f"[Stage 2/5] 소속사 공식 채널에서 '{singer_name}' 고화질 사진 {len(downloaded)}장 수집 완료.")
+    return downloaded
+
+
+def search_official_press_release_photos(
+    singer_name: str,
+    target_count: int = 10,
+    output_dir: str = "outputs/crawled",
+    existing_paths: Optional[set] = None
+) -> List[str]:
+    """3순위: 앨범 자켓 및 공식 보도자료(Press Release) 원본 화보 컷을 수집합니다."""
+    if target_count <= 0:
+        return []
+    os.makedirs(output_dir, exist_ok=True)
+    existing_paths = existing_paths or set()
+
+    queries = [
+        f"{singer_name} 공식 프로필 사진",
+        f"{singer_name} 앨범 자켓 원본",
+        f"{singer_name} 공식 보도자료 화보"
+    ]
+
+    img_urls = []
+    for q in queries:
+        try:
+            d_url = f"https://search.daum.net/search?w=img&q={quote(q)}"
+            d_req = urllib.request.Request(d_url, headers=HEADERS)
+            d_html = urllib.request.urlopen(d_req, context=SSL_CTX, timeout=6).read().decode('utf-8', errors='ignore')
+            matches = re.findall(r'https?://[a-zA-Z0-9_./-]+\.(?:jpg|jpeg|png)', d_html)
+            for m in matches:
+                if m not in img_urls and not any(b in m.lower() for b in ['favicon', 'logo', 'icon', 'btn_']):
+                    img_urls.append(m)
+        except Exception:
+            pass
+
+    downloaded = []
+    for idx, u in enumerate(img_urls):
+        if len(downloaded) >= target_count:
+            break
+        fn = f"press_{singer_name}_{idx+1}.jpg"
+        fp = os.path.abspath(os.path.join(output_dir, fn))
+        if fp in existing_paths:
+            continue
+        try:
+            req = urllib.request.Request(u, headers=HEADERS)
+            data = urllib.request.urlopen(req, context=SSL_CTX, timeout=5).read()
+            if len(data) > 10000:
+                with open(fp, "wb") as f:
+                    f.write(data)
+                if is_valid_photo(fp, min_w=300, min_h=250):
+                    downloaded.append(fp)
+                    PHOTO_SOURCE_MAP[fp] = "official_press"
+                else:
+                    if os.path.exists(fp):
+                        os.remove(fp)
+        except Exception:
+            pass
+
+    logger.info(f"[Stage 3/5] 공식 보도자료/프로필에서 '{singer_name}' 사진 {len(downloaded)}장 수집 완료.")
+    return downloaded
+
+
 def fetch_singer_photos(
     singer_name: str,
     target_count: int = 30,
@@ -257,65 +496,105 @@ def fetch_singer_photos(
     db_path: Optional[str] = None
 ) -> List[str]:
     """
-    해당 가수의 고화질 보도/콘서트/프로필 사진을 반환합니다.
-    
-    [핵심 원칙: 가수 DB 우선 -> 부족/다양성 부족 시 외부 수집 -> 선별 후 저장]
-    1. Media DB (media_library.db)에서 해당 가수의 기존 유효 사진을 우선 조회합니다.
-    2. DB에 유효 사진이 target_count 이상 있으면 즉시 반환 (외부 크롤링 0회로 고속 처리).
-    3. DB 사진이 N장 (N < target_count)이면, 부족한 missing_count = target_count - N 만큼만
-       외부 Bing 검색을 통해 세로형/얼굴인식 고화질 사진을 수집하여 결합합니다.
-    4. DB 조회가 실패하거나 비어있으면 100% 외부 크롤링으로 안전하게 폴백합니다.
+    해당 가수의 고화질 5단계 계층형 출처 수집기:
+      1단계: 기존 미디어 DB (media_library.db) 보관 사진 (최우선 불러오기)
+      2단계: 공식 인스타그램 / 공식 SNS 피드 원본 고화질 컷
+      3단계: 소속사 공식 채널 (네이버 공식 포스트 / 카카오 채널) 비하인드 화보
+      4단계: 앨범 자켓 및 공식 보도자료 (Press Kit) 원본 컷
+      5단계: 일반 웹 이미지 검색 (위 1~4단계 수량이 부족할 때만 안전 Fallback)
     """
-    db_photos: List[str] = []
+    final_photos: List[str] = []
+    seen_paths: set = set()
 
-    # 1. 가수 DB 우선 조회
+    # -------------------------------------------------------------
+    # 1단계 (⚡ DB 우선): media_library.db 보관 사진 로딩
+    # -------------------------------------------------------------
     try:
         from engine.media_db import query_singer_photos
-        raw_db_photos = query_singer_photos(
+        raw_db = query_singer_photos(
             singer_name=singer_name,
             limit=target_count,
             exclude_recent_project_id=project_id,
             db_path=db_path
         )
-        if raw_db_photos:
-            for p in raw_db_photos:
+        if raw_db:
+            for p in raw_db:
                 norm_p = os.path.abspath(os.path.normpath(p))
-                if os.path.isfile(norm_p):
-                    db_photos.append(norm_p)
-            logger.info(f"Media DB returned {len(db_photos)} existing photos for singer '{singer_name}'.")
+                if os.path.isfile(norm_p) and norm_p not in seen_paths:
+                    final_photos.append(norm_p)
+                    seen_paths.add(norm_p)
+                    PHOTO_SOURCE_MAP[norm_p] = "media_db"
+            logger.info(f"[Stage 1/5 DB] Media DB에서 '{singer_name}' 사진 {len(final_photos)}장 로딩 완료.")
     except Exception as e:
-        logger.warning(f"Media DB lookup failed for singer '{singer_name}' ({e}). Seamlessly falling back to external crawl.")
-        db_photos = []
+        logger.warning(f"[Stage 1/5 DB] DB 조회 실패: {e}")
 
-    # 2. DB 사진이 충분한 경우 즉시 반환
-    if len(db_photos) >= target_count:
-        logger.info(f"Media DB fulfilled {len(db_photos[:target_count])}/{target_count} photos for '{singer_name}'.")
-        return db_photos[:target_count]
+    if len(final_photos) >= target_count:
+        return final_photos[:target_count]
 
-    # 3. 부족 수량(missing_count) 계산
-    missing_count = target_count - len(db_photos)
-    logger.info(f"DB provided {len(db_photos)}/{target_count} photos for '{singer_name}'. Scraping missing {missing_count} photos from Bing...")
-
-    # 4. 부족한 수량만큼만 외부 고화질 수집
-    scraped_photos: List[str] = []
+    # -------------------------------------------------------------
+    # 2단계 (📸 공식 인스타/SNS): 인스타그램/SNS 원본 수집
+    # -------------------------------------------------------------
+    need_cnt = target_count - len(final_photos)
     try:
-        scraped_photos = _crawl_external_singer_photos(
-            singer_name=singer_name,
-            target_count=missing_count,
-            output_dir=output_dir,
-            existing_paths=set(db_photos)
-        )
-    except Exception as e:
-        logger.error(f"External crawling failed for '{singer_name}': {e}")
-        scraped_photos = []
+        insta_photos = search_instagram_official_photos(singer_name, target_count=min(12, need_cnt), output_dir=output_dir, existing_paths=seen_paths)
+        for p in insta_photos:
+            if p not in seen_paths:
+                final_photos.append(p)
+                seen_paths.add(p)
+    except Exception as e_insta:
+        logger.warning(f"Stage 2 Instagram crawl warning: {e_insta}")
 
-    # 5. DB 사진(우선) + 신규 수집 사진 결합
-    combined = list(db_photos)
-    for p in scraped_photos:
-        if p not in combined:
-            combined.append(p)
+    if len(final_photos) >= target_count:
+        return final_photos[:target_count]
 
-    return combined
+    # -------------------------------------------------------------
+    # 3단계 (🏢 소속사 공식 채널): 네이버 포스트/카카오 채널 수집
+    # -------------------------------------------------------------
+    need_cnt = target_count - len(final_photos)
+    try:
+        agency_photos = search_agency_official_photos(singer_name, target_count=min(10, need_cnt), output_dir=output_dir, existing_paths=seen_paths)
+        for p in agency_photos:
+            if p not in seen_paths:
+                final_photos.append(p)
+                seen_paths.add(p)
+    except Exception as e_agency:
+        logger.warning(f"Stage 3 Agency channel crawl warning: {e_agency}")
+
+    if len(final_photos) >= target_count:
+        return final_photos[:target_count]
+
+    # -------------------------------------------------------------
+    # 4단계 (📰 공식 보도자료/앨범): 프로필 & 앨범 자켓 수집
+    # -------------------------------------------------------------
+    need_cnt = target_count - len(final_photos)
+    try:
+        press_photos = search_official_press_release_photos(singer_name, target_count=min(8, need_cnt), output_dir=output_dir, existing_paths=seen_paths)
+        for p in press_photos:
+            if p not in seen_paths:
+                final_photos.append(p)
+                seen_paths.add(p)
+    except Exception as e_press:
+        logger.warning(f"Stage 4 Press release crawl warning: {e_press}")
+
+    if len(final_photos) >= target_count:
+        return final_photos[:target_count]
+
+    # -------------------------------------------------------------
+    # 5단계 (🌐 일반 웹 검색 Fallback): 수량 부족 시 안전 백업
+    # -------------------------------------------------------------
+    need_cnt = target_count - len(final_photos)
+    logger.info(f"[Stage 5/5 Fallback] 1~4단계 수집 결과 {len(final_photos)}/{target_count}장. 부족 수량 {need_cnt}장 일반 웹 검색 수행...")
+    try:
+        web_photos = _crawl_external_singer_photos(singer_name, target_count=need_cnt, output_dir=output_dir, existing_paths=seen_paths)
+        for p in web_photos:
+            if p not in seen_paths:
+                final_photos.append(p)
+                seen_paths.add(p)
+                PHOTO_SOURCE_MAP[p] = "web_fallback"
+    except Exception as e_web:
+        logger.error(f"Stage 5 Web search fallback error: {e_web}")
+
+    return final_photos
 
 
 def save_curated_photos(

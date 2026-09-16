@@ -8,6 +8,7 @@ import time
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from crawler.news_parser import parse_naver_news
+from crawler.image_enricher import fetch_singer_photos, get_photo_source_badge
 from engine.ai_generator import generate_contents
 from engine.tts_engine import synthesize_speech, DEFAULT_VOICE, MALE_VOICE
 from engine.thumbnail_drawer import create_high_contrast_thumbnail
@@ -533,6 +534,7 @@ with main_tab_produce:
                         is_sel = (global_idx == cur_img_idx)
                         with cols[c_idx]:
                             st.image(img_p, use_container_width=True)
+                            st.caption(get_photo_source_badge(img_p))
                             b_c1, b_c2, b_c3 = st.columns([1.25, 1.0, 0.75])
                             with b_c1:
                                 btn_txt = "⭐ 커버" if is_sel else "⭐ 선택"
