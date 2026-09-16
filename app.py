@@ -81,13 +81,15 @@ def open_setting_dialog():
         if st.button("💾 Gemini 키 영구 저장", key="btn_save_gemini_modal"):
             if api_key_input.strip():
                 save_env_key("GEMINI_API_KEY", api_key_input)
-                st.success("Gemini API 키가 저장되었습니다!")
+                st.success("Gemini API 키가 성공적으로 저장 및 연결되었습니다!")
+                time.sleep(0.5)
+                st.rerun()
             else:
                 st.warning("키를 입력해 주세요.")
         if api_key_input.strip() or saved_gemini:
-            st.caption("🟢 API 키가 설정되어 있습니다.")
+            st.caption("🟢 Gemini API 키가 정상 등록되어 연결되어 있습니다.")
         else:
-            st.caption("🟡 키가 없으면 내장 템플릿으로 자동 생성됩니다.")
+            st.caption("🟡 키가 미입력 상태입니다. 미입력 시 내장 기본 템플릿으로 자동 전환됩니다.")
 
     elif provider == "openai":
         saved_openai = load_env_key("OPENAI_API_KEY")
@@ -95,6 +97,8 @@ def open_setting_dialog():
         if st.button("💾 OpenAI 키 영구 저장", key="btn_save_openai_modal"):
             save_env_key("OPENAI_API_KEY", api_key_input)
             st.success("OpenAI API 키 저장 완료!")
+            time.sleep(0.5)
+            st.rerun()
 
     st.divider()
     st.subheader("🎬 무료 B-roll 스톡 영상 API 설정")
@@ -104,6 +108,8 @@ def open_setting_dialog():
         if pexels_input.strip():
             save_env_key("PEXELS_API_KEY", pexels_input)
             st.success("Pexels API 키가 저장되었습니다!")
+            time.sleep(0.5)
+            st.rerun()
         else:
             st.warning("키를 입력해 주세요.")
     if pexels_input.strip() or saved_pexels:
