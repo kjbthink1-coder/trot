@@ -120,14 +120,14 @@ def build_ken_burns_filter(motion: str, width: int, height: int, dur: float) -> 
         # 중앙(가수 얼굴)을 향해 1.0x -> 1.20x 부드러운 클로즈업 줌인
         return (
             f"scale={width}:{height}:force_original_aspect_ratio=increase,"
-            f"scale=w='{width}*(1+0.20*t/{d:.2f})':h='{height}*(1+0.20*t/{d:.2f})':eval=frame,"
+            f"scale=w='2*trunc({width}*(1+0.20*t/{d:.2f})/2)':h='2*trunc({height}*(1+0.20*t/{d:.2f})/2)':eval=frame,"
             f"crop={width}:{height}:(in_w-{width})/2:(in_h-{height})/2,format=yuv420p"
         )
     elif motion == "zoom_out":
         # 클로즈업(1.20x)에서 시원하게 줌아웃 (가수 전신과 무대 조명 공개)
         return (
             f"scale={width}:{height}:force_original_aspect_ratio=increase,"
-            f"scale=w='{width}*(1.20-0.20*t/{d:.2f})':h='{height}*(1.20-0.20*t/{d:.2f})':eval=frame,"
+            f"scale=w='2*trunc({width}*(1.20-0.20*t/{d:.2f})/2)':h='2*trunc({height}*(1.20-0.20*t/{d:.2f})/2)':eval=frame,"
             f"crop={width}:{height}:(in_w-{width})/2:(in_h-{height})/2,format=yuv420p"
         )
     elif motion == "pan_bottom_top":
@@ -169,7 +169,9 @@ def render_shorts_video(
     image_paths: list[str],
     stock_video_path: str = None,
     singer_clips: list[str] = None,
+    singer_cc_clips: list[str] = None,
     broll_video_path: str = None,
+    broll_video_paths: list[str] = None,
     srt_path: str = None,
     output_path: str = "outputs/videos/shorts_final.mp4",
     width: int = 1080,
@@ -181,7 +183,7 @@ def render_shorts_video(
 ) -> Union[str, tuple[str, list[dict]]]:
     """
     고대비 썸네일, 2.5~3.0초 단위 다이내믹 켄 번즈(줌/패닝) 사진 컷들, 가수 무대 짤(클립),
-    스톡 리액션 영상 / B-roll 영상, Edge-TTS 음성을 결합하여 영웅대학 스타일의 고몰입 세로 쇼츠 MP4를 렌더링합니다.
+    가수별 3~4초 CC 영상 클립, 스톡 리액션 영상 / B-roll 영상, Edge-TTS 음성을 결합하여 영웅대학 스타일의 고몰입 세로 쇼츠 MP4를 렌더링합니다.
     - Master Clock: TTS 오디오 길이 기준 strictly <= 60.0s 바운딩
     - timeline_segments 메타데이터 생성 및 shorts_timeline.json 자동 저장
     """
@@ -203,7 +205,7 @@ def render_shorts_video(
     temp_dir = os.path.abspath("outputs/temp_render")
     os.makedirs(temp_dir, exist_ok=True)
 
-    # [핵심] 모든 이미지와 썸네일을 표준 baseline RGB JPEG로 정규화 (AVIF, WebP, 투명 PNG 포맷 대응)
+    # [핵심] 모든 이미지와 썸네일을 표준 baseline RGB JPEG로 정규화
     from PIL import Image
     norm_thumb_path = os.path.join(temp_dir, "norm_thumb.jpg")
     try:
@@ -232,46 +234,31 @@ def render_shorts_video(
             valid_images.append(img_p)
 
     valid_singer_clips = [os.path.abspath(c) for c in (singer_clips or []) if os.path.exists(c)]
+    valid_cc_clips = [os.path.abspath(c) for c in (singer_cc_clips or []) if os.path.exists(c)]
+
+    all_broll_paths = []
+    if broll_video_paths:
+        all_broll_paths.extend([os.path.abspath(bp) for bp in broll_video_paths if os.path.exists(bp)])
+    if broll_video_path and os.path.exists(broll_video_path):
+        abs_bp = os.path.abspath(broll_video_path)
+        if abs_bp not in all_broll_paths:
+            all_broll_paths.append(abs_bp)
 
     thumb_dur = 2.0
     clip_dur = 3.5
 
-    # 영상 클립 풀 구성 (가수 무대 짤들 + B-roll / 스톡 리액션 영상)
+    # 영상 클립 풀 구성 (가수 무대 짤 + 가수 CC 영상 클립 + B-roll 리스트 + 스톡 영상)
     active_video_clips = []
     for sc in valid_singer_clips:
         active_video_clips.append(("stage_clip", sc))
+    for cc in valid_cc_clips:
+        active_video_clips.append(("singer_cc_video", cc))
+    for br in all_broll_paths:
+        active_video_clips.append(("broll", br))
+    if stock_video_path and os.path.exists(stock_video_path):
+        active_video_clips.append(("stock", os.path.abspath(stock_video_path)))
 
-    has_broll = bool(broll_video_path and os.path.exists(broll_video_path))
-    has_stock = bool(stock_video_path and os.path.exists(stock_video_path))
-
-    min_img_total = len(valid_images) * 2.0
-
-    if has_broll:
-        norm_broll = os.path.abspath(broll_video_path)
-        if has_stock:
-            norm_stock = os.path.abspath(stock_video_path)
-            # B-roll과 스톡 영상 모두 제공된 경우: 총 재생시간을 초과하지 않고 수용 가능한지 검증
-            # 4개 영상클립(무대2 + 스톡1 + B-roll 1)과 최소 이미지 시간이 오디오 길이에 맞는지 확인
-            candidate_video_count = len(valid_singer_clips) + 2
-            if thumb_dur + (candidate_video_count * 3.0) + min_img_total <= total_duration:
-                # 충분한 길이가 확보되면 두 영상 모두 배치 (B-roll을 30~40초 중간 구역에 위치)
-                mid = len(active_video_clips) // 2
-                active_video_clips.insert(mid, ("stock", norm_stock))
-                active_video_clips.insert(mid + 1, ("broll", norm_broll))
-                print(f"[Video Renderer] B-roll 클립과 스톡 영상을 함께 배치합니다. (총 영상 클립: {len(active_video_clips)}개)")
-            else:
-                # 재생시간이 빠듯한 경우, B-roll이 스톡 리액션 슬롯을 대체하여 전체 길이 초과 방지
-                mid = len(active_video_clips) // 2
-                active_video_clips.insert(mid, ("broll", norm_broll))
-                print(f"[Video Renderer] 총 재생시간({total_duration:.1f}초) 최적화를 위해 B-roll이 스톡 리액션을 대체합니다.")
-        else:
-            mid = len(active_video_clips) // 2
-            active_video_clips.insert(mid, ("broll", norm_broll))
-            print(f"[Video Renderer] B-roll 클립 배치 완료: {norm_broll}")
-    elif has_stock:
-        # B-roll이 없는 경우 기존 베이스라인 동작 100% 동일 유지
-        mid = len(active_video_clips) // 2
-        active_video_clips.insert(mid, ("stock", os.path.abspath(stock_video_path)))
+    print(f"[Video Renderer] 커스텀 영상 클립 조합 구성 완료 (총 {len(active_video_clips)}개 클립: Stage={len(valid_singer_clips)}, CC={len(valid_cc_clips)}, Broll={len(all_broll_paths)})")
 
     total_video_dur = len(active_video_clips) * clip_dur
     min_img_total = len(valid_images) * 2.0
@@ -296,10 +283,11 @@ def render_shorts_video(
         ffmpeg_exe, "-y",
         "-loop", "1", "-i", os.path.abspath(thumbnail_path),
         "-t", str(thumb_dur),
-        "-vf", f"scale={width}:{height},format=yuv420p",
+        "-vf", f"scale={width}:{height},format=yuv420p,setsar=1",
         "-r", str(fps),
         "-c:v", "libx264",
         "-preset", "veryfast",
+        "-video_track_timescale", "30000",
         "-an",
         thumb_clip
     ]
@@ -319,7 +307,7 @@ def render_shorts_video(
         motion = KEN_BURNS_MOTIONS[idx % len(KEN_BURNS_MOTIONS)]
         c_file = os.path.join(temp_dir, f"clip_img_{idx}_{motion}.mp4")
 
-        kb_filter = build_ken_burns_filter(motion, width, height, img_dur)
+        kb_filter = build_ken_burns_filter(motion, width, height, img_dur) + ",setsar=1"
         cmd_img = [
             ffmpeg_exe, "-y",
             "-loop", "1", "-i", img_p,
@@ -328,6 +316,7 @@ def render_shorts_video(
             "-r", str(fps),
             "-c:v", "libx264",
             "-preset", "veryfast",
+            "-video_track_timescale", "30000",
             "-an",
             c_file
         ]
@@ -346,10 +335,11 @@ def render_shorts_video(
                 ffmpeg_exe, "-y",
                 "-loop", "1", "-i", img_p,
                 "-t", f"{img_dur:.2f}",
-                "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p",
+                "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p,setsar=1",
                 "-r", str(fps),
                 "-c:v", "libx264",
                 "-preset", "veryfast",
+                "-video_track_timescale", "30000",
                 "-an",
                 c_file
             ]
@@ -369,7 +359,7 @@ def render_shorts_video(
         f"split[bg][fg];"
         f"[bg]scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},boxblur=20:5[bgb];"
         f"[fg]scale={width}:-1:force_original_aspect_ratio=decrease[fgs];"
-        f"[bgb][fgs]overlay=(W-w)/2:(H-h)/2,format=yuv420p"
+        f"[bgb][fgs]overlay=(W-w)/2:(H-h)/2,format=yuv420p,setsar=1"
     )
     for idx, (vtype, vpath) in enumerate(active_video_clips):
         c_file = os.path.join(temp_dir, f"clip_v_{idx}_{vtype}.mp4")
@@ -381,6 +371,7 @@ def render_shorts_video(
             "-r", str(fps),
             "-c:v", "libx264",
             "-preset", "veryfast",
+            "-video_track_timescale", "30000",
             "-an",
             c_file
         ]
@@ -461,14 +452,17 @@ def render_shorts_video(
             base_name = os.path.basename(c)
             f.write(f"file '{base_name}'\n")
 
-    # 3단계: 무음 비디오 트랙 합성
+    # 3단계: 무음 비디오 트랙 합성 (timestamps 연속성 보장을 위한 ultrafast 인코딩)
     combined_video = os.path.join(temp_dir, "combined_no_audio.mp4")
     cmd_concat = [
         ffmpeg_exe, "-y",
         "-f", "concat",
         "-safe", "0",
         "-i", "concat_list.txt",
-        "-c", "copy",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-r", str(fps),
+        "-an",
         "combined_no_audio.mp4"
     ]
     subprocess.run(cmd_concat, cwd=temp_dir, check=True, capture_output=True)

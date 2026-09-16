@@ -26,8 +26,15 @@ from engine.clip_manager import (
 from engine.media_db import get_media_stats, get_db_connection, compute_file_hash, update_media_file_hash
 from engine.scene_analyzer import analyze_script_scenes
 from engine.broll_engine import get_or_fetch_broll
-from crawler.image_enricher import save_curated_photos, fetch_singer_photos
 from engine.qa import run_full_qa
+from engine.cc_video_engine import (
+    get_db_singer_cc_clips,
+    search_youtube_cc_videos,
+    download_raw_cc_video,
+    trim_and_normalize_cc_clip,
+    detect_video_face_center_percent,
+    get_cc_crop_preview_frame
+)
 import streamlit_cropper as sc
 from PIL import Image
 
@@ -538,6 +545,106 @@ with main_tab_produce:
                 st.markdown('</div>', unsafe_allow_html=True)
             else:
                 st.info("선택된 사진이 없습니다. '🔄 원본 전체 복원'을 누르세요.")
+
+            # 🎬 [신규 기능] 해당 가수 YouTube Creative Commons(CC) 영상 수집 & 3~4초 컷편집 패널
+            st.divider()
+            st.markdown(f"##### 🎬 [{parsed['singer']}] YouTube Creative Commons(CC) 영상 수집 및 3~4초 컷편집 스튜디오")
+            st.caption("가수의 실제 영상 컷(3~4초)을 직접 미리보고 자른 후 가수 미디어 라이브러리에 저장·재사용합니다 (일반 B-roll과 엄격히 분리).")
+
+            # 1. DB FIRST: 가수의 기존 축적된 singer_cc_video DB 목록 표시
+            singer_cc_db_clips = get_db_singer_cc_clips(parsed['singer'], limit=10)
+            if singer_cc_db_clips:
+                st.markdown(f"🗄️ **가수 라이브러리 DB 보유 클립 ({len(singer_cc_db_clips)}개)**")
+                cols_cc_db = st.columns(min(4, len(singer_cc_db_clips)))
+                for c_idx, c_info in enumerate(singer_cc_db_clips):
+                    with cols_cc_db[c_idx % 4]:
+                        st.caption(f"📹 {c_info.get('video_title', 'CC Clip')[:20]}... ({c_info.get('clip_duration', 3.5):.1f}초)")
+                        if os.path.exists(c_info['file_path']):
+                            st.video(c_info['file_path'])
+
+            col_cc_btn, col_cc_info = st.columns([1.5, 3])
+            with col_cc_btn:
+                if st.button(f"🔍 [{parsed['singer']}] YouTube CC 영상 5개 수집", key="btn_fetch_youtube_cc"):
+                    with st.spinner(f"YouTube에서 [{parsed['singer']}] Creative Commons 영상 탐색 중..."):
+                        cc_results = search_youtube_cc_videos(parsed['singer'], max_results=5)
+                        st.session_state.youtube_cc_candidates = cc_results
+                        st.rerun()
+
+            cc_candidates = st.session_state.get("youtube_cc_candidates", [])
+            if cc_candidates:
+                st.markdown("##### 📹 수집된 CC 영상 후보 목록 (구간 자르기 & DB 저장)")
+                for idx, item in enumerate(cc_candidates):
+                    with st.expander(f"🎬 후보 #{idx+1}: {item['video_title']} ({item['channel_name']})", expanded=(idx==0)):
+                        c_v1, c_v2 = st.columns([1, 1.2])
+                        with c_v1:
+                            st.caption(f"🔗 [YouTube 원본 링크]({item['youtube_url']}) | 원본 길이: {item['original_duration']}초")
+                            st.markdown(f"**라이선스**: `{item['license']}`")
+                            
+                            t_start = st.number_input(f"시작 시간(초)", min_value=0.0, max_value=float(max(1, item['original_duration']-1)), value=10.0, step=1.0, key=f"cc_start_{idx}")
+                            t_end = st.number_input(f"종료 시간(초)", min_value=float(t_start+1.0), max_value=float(item['original_duration']), value=float(min(item['original_duration'], t_start+3.8)), step=0.5, key=f"cc_end_{idx}")
+                            clip_len = round(t_end - t_start, 1)
+                            st.info(f"✂️ 자르기 구간: `{t_start:.1f}s ~ {t_end:.1f}s` (클립 길이: {clip_len}초)")
+
+                            crop_x_val = st.slider(
+                                "↔️ 세로 크롭 좌우 위치 조절 (0%: 왼쪽 ~ 50%: 중앙 ~ 100%: 오른쪽)",
+                                min_value=0, max_value=100, value=50, step=5,
+                                key=f"cc_crop_x_{idx}",
+                                help="가수 얼굴이 왼쪽에 쏠려있으면 30% 이하로, 우측에 쏠려있으면 70% 이상으로 설정하세요."
+                            )
+
+                        with c_v2:
+                            st.markdown("##### 📸 9:16 세로 구도 실시간 미리보기")
+                            # 1초 실시간 크롭 미리보기 프레임 추출
+                            preview_img_path = None
+                            try:
+                                raw_p_tmp = download_raw_cc_video(item["youtube_url"])
+                                preview_img_path = get_cc_crop_preview_frame(
+                                    raw_video_path=raw_p_tmp,
+                                    sample_time=float(t_start),
+                                    crop_x_percent=float(crop_x_val)
+                                )
+                            except Exception as e_pv:
+                                preview_img_path = None
+
+                            if preview_img_path and os.path.exists(preview_img_path):
+                                st.image(
+                                    preview_img_path,
+                                    caption=f"📸 시작시간 {t_start:.1f}s 프레임 (좌우 {crop_x_val}%)",
+                                    width=240
+                                )
+                            else:
+                                st.info("💡 1초 원본 영상 다운로드 중... 잠시 후 미리보기가 생성됩니다.")
+
+                            col_act1, col_act2 = st.columns([1, 1])
+                            with col_act1:
+                                if st.button(f"🤖 가수 얼굴 자동 탐지", key=f"btn_autoface_{idx}"):
+                                    with st.spinner("가수 얼굴 위치 탐지 중..."):
+                                        try:
+                                            raw_tmp = download_raw_cc_video(item["youtube_url"])
+                                            detected_x = detect_video_face_center_percent(raw_tmp, sample_time=t_start)
+                                            st.success(f"🎯 얼굴 위치: `{detected_x:.1f}%` (슬라이더를 {int(detected_x)}%로 조절)")
+                                        except Exception as e_fd:
+                                            st.warning(f"탐지 참고: {e_fd}")
+
+                            with col_act2:
+                                if st.button(f"💾 3~4초 클립 컷 & DB 저장", key=f"btn_trim_cc_{idx}", type="primary"):
+                                    with st.spinner(f"1080x1920 3~4초 클립 컷편집 중 (구도 {crop_x_val}%)..."):
+                                        try:
+                                            raw_p = download_raw_cc_video(item["youtube_url"])
+                                            trimmed_info = trim_and_normalize_cc_clip(
+                                                raw_video_path=raw_p,
+                                                start_time=t_start,
+                                                end_time=t_end,
+                                                singer_name=parsed['singer'],
+                                                metadata=item,
+                                                crop_x_percent=float(crop_x_val)
+                                            )
+                                            st.success(f"🎉 3~4초 CC 클립(구도 {crop_x_val}%)이 DB에 저장되었습니다!")
+                                            time.sleep(0.5)
+                                            st.rerun()
+                                        except Exception as e_trim:
+                                            st.error(f"클립 컷편집 중 오류: {e_trim}")
+
             st.markdown('</div>', unsafe_allow_html=True) # End Card 2
 
             # 💳 [카드 3] 📜 60초 쇼츠 나레이션 대본 (전체 화면 너비 카드)
@@ -613,18 +720,63 @@ with main_tab_produce:
                     sel_cat_key = st.selectbox("B-roll 카테고리 선택", list(cat_map.keys()))
                     selected_broll_cat, selected_broll_tag = cat_map[sel_cat_key]
 
+                st.divider()
+                st.markdown("##### 🎞️ 쇼츠 미디어 수량 & 구성 제어 (Custom Clip Mix)")
+                
+                preset_choice = st.radio(
+                    "조합 프리셋 선택",
+                    [
+                        "⚡ 추천 멀티 믹스 (CC 1개 + B-roll 1개)",
+                        "📷 사진 중심 쇼츠 (CC 0개 + B-roll 0개)",
+                        "🎬 가수 CC 무대 강조 (CC 2개 + B-roll 0개)",
+                        "🎨 화려한 B-roll 믹스 (CC 1개 + B-roll 2개)",
+                        "⚙️ 커스텀 수량 직접 지정"
+                    ],
+                    index=0,
+                    help="쇼츠 영상에 넣을 가수 CC 영상, 일반 B-roll, 무대 짤의 수량을 설정합니다."
+                )
+
+                if "📷 사진 중심" in preset_choice:
+                    init_cc, init_broll, init_stage = 0, 0, 0
+                elif "🎬 가수 CC 무대" in preset_choice:
+                    init_cc, init_broll, init_stage = 2, 0, 0
+                elif "🎨 화려한 B-roll" in preset_choice:
+                    init_cc, init_broll, init_stage = 1, 2, 0
+                elif "⚙️ 커스텀" in preset_choice:
+                    init_cc, init_broll, init_stage = 1, 1, 1 if stored_clip_count > 0 else 0
+                else: # ⚡ 추천 멀티 믹스
+                    init_cc, init_broll, init_stage = 1, 1, 1 if stored_clip_count > 0 else 0
+
+                c_cc, c_br, c_st = st.columns(3)
+                with c_cc:
+                    num_cc_count = st.number_input("🎬 가수 CC 영상", min_value=0, max_value=3, value=init_cc, step=1)
+                with c_br:
+                    num_broll_count = st.number_input("📽️ 일반 B-roll", min_value=0, max_value=3, value=init_broll, step=1)
+                with c_st:
+                    num_stage_count = st.number_input("🎤 보관함 무대짤", min_value=0, max_value=min(3, max(0, stored_clip_count)), value=min(init_stage, max(0, stored_clip_count)), step=1)
+
+                st.markdown(
+                    f"""
+                    <div style="background-color: #F0FDF4; border: 1px solid #BBF7D0; border-radius: 8px; padding: 10px 14px; margin-top: 10px; font-size: 0.88rem; color: #166534; font-weight: 500;">
+                        📊 <b>타임라인 구성 예상:</b> CC 영상 {num_cc_count}개 + B-roll {num_broll_count}개 + 무대 짤 {num_stage_count}개<br>
+                        💡 <i>나머지 남은 재생시간은 수집된 기사 사진들로 대본 길이에 맞춰 자동 켄 번즈 교차 배치됩니다.</i>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+
             with col_render:
                 st.markdown("#### 🚀 원클릭 쇼츠 영상 렌더링")
-                st.caption("Edge-TTS 음성 + 음성 싱크 자막 합성 + 기사 사진 & 켄 번스 무빙 + 고대비 썸네일 (1080x1920 MP4)")
+                st.caption("Edge-TTS 음성 + 음성 싱크 자막 합성 + 커스텀 미디어 믹스 + 켄 번즈 무빙 + 고대비 썸네일 (1080x1920 MP4)")
                 
                 render_btn = st.button("🎬 쇼츠 영상(MP4) 즉시 렌더링", type="primary", use_container_width=True)
                 
                 if render_btn:
-                    with st.spinner("Edge-TTS 음성 합성 및 무대 짤 교차 편집 렌더링 중... (약 15~25초 소요)"):
+                    with st.spinner("Edge-TTS 음성 합성 및 가수 CC 영상/사진 믹스 렌더링 중... (약 15~25초 소요)"):
                         try:
                             audio_path, srt_path = synthesize_speech(edited_script, voice=selected_voice)
                             stock_clip = ensure_stock_video() if use_reaction_card else None
-                            stage_clips = get_random_singer_clips(singer_name, count=2) if use_stage_clips else []
+                            stage_clips = get_random_singer_clips(singer_name, count=num_stage_count) if (num_stage_count > 0 and stored_clip_count > 0) else []
                             
                             all_imgs = parsed["images"]
                             if selected_bg and selected_bg in all_imgs:
@@ -632,18 +784,26 @@ with main_tab_produce:
                             else:
                                 video_imgs = all_imgs
 
+                            # CC 영상 클립 DB FIRST 탐색 (요청 수량만큼 추출)
+                            cc_file_paths = []
+                            if num_cc_count > 0:
+                                db_cc = get_db_singer_cc_clips(singer_name, limit=num_cc_count * 2)
+                                cc_file_paths = [c["file_path"] for c in db_cc if os.path.exists(c.get("file_path", ""))][:num_cc_count]
+
                             proj_id = f"shorts_{singer_name}_{int(time.time())}"
                             try:
                                 save_curated_photos(singer_name=singer_name, approved_photos=video_imgs, project_id=proj_id)
                             except Exception as e_db:
                                 print(f"[MediaDB] 선별 사진 저장 알림: {e_db}")
 
-                            broll_clip = None
-                            if broll_mode != "사용 안 함 (가수 무대 짤만 사용 - 기본)" and selected_broll_cat:
+                            # B-roll 영상 탐색 및 획득 (요청 수량만큼 추출)
+                            broll_clips_list = []
+                            if num_broll_count > 0 and selected_broll_cat:
                                 try:
-                                    broll_clip = get_or_fetch_broll(category=selected_broll_cat, tag=selected_broll_tag, target_duration=3.5)
-                                except Exception:
-                                    broll_clip = None
+                                    broll_clips_list = get_or_fetch_broll_multiple(category=selected_broll_cat, tag=selected_broll_tag, count=num_broll_count, target_duration=3.5)
+                                except Exception as e_br:
+                                    print(f"[B-roll Engine] B-roll 추출 알림: {e_br}")
+                                    broll_clips_list = []
 
                             video_path = render_shorts_video(
                                 audio_path=audio_path,
@@ -651,10 +811,11 @@ with main_tab_produce:
                                 image_paths=video_imgs,
                                 stock_video_path=stock_clip,
                                 singer_clips=stage_clips,
+                                singer_cc_clips=cc_file_paths,
+                                broll_video_paths=broll_clips_list,
                                 srt_path=srt_path,
                                 sub_font_size=sub_size,
-                                sub_color=sub_color,
-                                broll_video_path=broll_clip
+                                sub_color=sub_color
                             )
                             st.session_state.rendered_video = video_path
                             st.success("쇼츠 영상 렌더링 성공! 영상 플레이어가 아래에 바로 준비되었습니다.")
@@ -710,10 +871,10 @@ with main_tab_produce:
                         st.markdown(f"#### ❌ 품질 검증 미달 (총점: {score:.1f} / 100점)")
 
                     cat_scores = qa_data.get("category_scores", {})
-                    c_tech = cat_scores.get("technical_specs", {"score": 0.0, "max_score": 20.0})
-                    c_fact = cat_scores.get("fact_accuracy", {"score": 0.0, "max_score": 30.0})
-                    c_rep = cat_scores.get("repeat_prevention", {"score": 0.0, "max_score": 25.0})
-                    c_content = cat_scores.get("content_quality") or cat_scores.get("ai_review", {"score": None, "max_score": 25.0})
+                    c_tech = cat_scores.get("technical") or cat_scores.get("technical_specs") or {"score": 0.0, "max_score": 20.0}
+                    c_fact = cat_scores.get("factual") or cat_scores.get("fact_accuracy") or {"score": 0.0, "max_score": 30.0}
+                    c_rep = cat_scores.get("repetition") or cat_scores.get("repeat_prevention") or {"score": 0.0, "max_score": 25.0}
+                    c_content = cat_scores.get("content_quality") or cat_scores.get("ai_review") or {"score": None, "max_score": 25.0}
 
                     ai_not_run = bool(
                         qa_data.get("ai_not_run", False)

@@ -439,13 +439,31 @@ def run_full_qa(
                 "passed": tech_res.get("passed", False),
                 "name": "기술 규격 (20점)"
             },
+            "technical_specs": {
+                "score": tech_score,
+                "max_score": 20.0,
+                "passed": tech_res.get("passed", False),
+                "name": "기술 규격 (20점)"
+            },
             "factual": {
                 "score": fact_score,
                 "max_score": 30.0,
                 "passed": fact_res.get("passed", False),
                 "name": "사실성/일치도 (30점)"
             },
+            "fact_accuracy": {
+                "score": fact_score,
+                "max_score": 30.0,
+                "passed": fact_res.get("passed", False),
+                "name": "사실성/일치도 (30점)"
+            },
             "repetition": {
+                "score": rep_score,
+                "max_score": 25.0,
+                "passed": rep_res.get("passed", False),
+                "name": "반복/다양성 (25점)"
+            },
+            "repeat_prevention": {
                 "score": rep_score,
                 "max_score": 25.0,
                 "passed": rep_res.get("passed", False),

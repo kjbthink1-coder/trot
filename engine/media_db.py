@@ -125,6 +125,28 @@ def init_db(db_path: Optional[str] = None) -> str:
             except Exception as e:
                 logger.warning(f"Could not add 'dhash' column to media table: {e}")
 
+        # Migration: Add singer_cc_video metadata columns if missing
+        cc_cols = {
+            "youtube_video_id": "TEXT",
+            "youtube_url": "TEXT",
+            "channel_name": "TEXT",
+            "video_title": "TEXT",
+            "original_start": "REAL",
+            "original_end": "REAL",
+            "clip_duration": "REAL",
+            "width": "INTEGER",
+            "height": "INTEGER",
+            "fps": "REAL",
+            "rights_status": "TEXT DEFAULT 'verified'"
+        }
+        for col_name, col_type in cc_cols.items():
+            if col_name not in media_columns:
+                try:
+                    cur.execute(f"ALTER TABLE media ADD COLUMN {col_name} {col_type};")
+                    logger.info(f"Migrated media table: added '{col_name}' column.")
+                except Exception as e:
+                    logger.warning(f"Could not add '{col_name}' column to media table: {e}")
+
         # 3. media_tags table
         cur.execute("""
             CREATE TABLE IF NOT EXISTS media_tags (

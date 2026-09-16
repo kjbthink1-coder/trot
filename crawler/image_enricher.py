@@ -19,8 +19,34 @@ HEADERS = {
 
 SSL_CTX = ssl._create_unverified_context()
 
+def is_logo_or_graphic(im: Image.Image) -> bool:
+    """
+    단색 배경에 텍스트가 박힌 언론사 대표 로고(예: THE FACT 붉은 로고, X 주황 로고 등),
+    아이콘, 배너, 그래픽 카드를 정밀하게 검출하여 차단합니다.
+    """
+    try:
+        rgb_im = im.convert("RGB")
+        small = rgb_im.resize((100, 100))
+        colors = small.getcolors(maxcolors=10000)
+        if not colors:
+            return False
+
+        total_pixels = 10000
+        sorted_colors = sorted(colors, key=lambda x: x[0], reverse=True)
+        top1_pct = sorted_colors[0][0] / total_pixels
+        top2_pct = (sorted_colors[0][0] + (sorted_colors[1][0] if len(sorted_colors) > 1 else 0)) / total_pixels
+
+        # 주 1~2개 색상의 비율이 70% 이상이면 단색 로고/배너/그래픽 카드로 판정하여 차단
+        if top1_pct > 0.60 or top2_pct > 0.72:
+            return True
+
+        return False
+    except Exception:
+        return False
+
+
 def is_valid_photo(file_path: str, min_w: int = 280, min_h: int = 200) -> bool:
-    """작은 아이콘(URL, A 등 버튼)을 필터링하고 FFmpeg 호환을 위해 표준 RGB JPEG로 정규화합니다."""
+    """작은 아이콘(URL, A 등 버튼) 및 단색 로고를 필터링하고 FFmpeg 호환을 위해 표준 RGB JPEG로 정규화합니다."""
     try:
         with Image.open(file_path) as im:
             w, h = im.size
@@ -28,6 +54,8 @@ def is_valid_photo(file_path: str, min_w: int = 280, min_h: int = 200) -> bool:
                 return False
             # 정방형에 가까운 초소형 아이콘 필터
             if w <= 64 and h <= 64:
+                return False
+            if is_logo_or_graphic(im):
                 return False
             rgb_im = im.convert("RGB")
         # AVIF, WebP 등을 순수 표준 JPEG로 재저장 (FFmpeg demuxer 오류 방지)
@@ -56,7 +84,7 @@ def _crawl_external_singer_photos(
     - 국내 대표 연예 포털(다음 뉴스/포토)을 1순위로 탐색하여 엉뚱한 해외 이미지/동음이의어 원천 차단
     - OpenCV Haar Cascade 얼굴 인식 점수 가산
     - 세로형(aspect-tall) 비율 우선
-    - 쇼핑몰/문서/단어장/만화/광고 엄격 차단
+    - 언론사 로고/쇼핑몰/문서/단어장/만화/광고 엄격 차단
     - 400x350 이상 고화질 선별
     """
     if target_count <= 0:
@@ -65,13 +93,16 @@ def _crawl_external_singer_photos(
     os.makedirs(output_dir, exist_ok=True)
     existing_paths = existing_paths or set()
 
-    # 엉뚱한 쇼핑몰 상품, 영어 단어장, 교재, 만화, 아이콘 도메인 및 키워드 강력 차단
+    # 엉뚱한 언론사 로고(THE FACT, X 등), 쇼핑몰 상품, 영어 단어장, 교재, 만화, 아이콘 도메인 및 키워드 강력 차단
     BLOCKED_KEYWORDS = [
         'icon', 'logo', 'banner', 'thumb', 'shop', 'product', 'item', 'goods', 
         'paint', 'roller', 'kuas', 'supra', 'tokopedia', 'lazada', 'shopee',
         'cartoon', 'anime', 'illustration', 'clipart', 'vector', 'drawing',
         'grammar', 'vocab', 'vocabulary', 'spoke', 'english', 'guide', 'worksheet',
-        'diagram', 'chart', 'infographic', 'document', 'pdf', 'slide'
+        'diagram', 'chart', 'infographic', 'document', 'pdf', 'slide',
+        'thefact', 'tf.co.kr', 'xports', 'xportsnews', 'newsen', 'starnews',
+        'mydaily', 'osen', 'dispatch', 'spotv', 'mhn', 'rnx', 'news1', 'newsis',
+        'yna.co.kr', 'herald', 'symbol', 'ci_', 'favicon', 'avatar', 'btn_'
     ]
 
     all_murls = []
@@ -160,6 +191,8 @@ def _crawl_external_singer_photos(
             # 유효성 검사 (최소 480x400 이상의 고화질 실사 사진만)
             im = Image.open(io.BytesIO(data))
             if im.width >= 480 and im.height >= 400:
+                if is_logo_or_graphic(im):
+                    continue
                 is_tall = (im.height >= im.width)
                 has_face = False
                 face_count = 0

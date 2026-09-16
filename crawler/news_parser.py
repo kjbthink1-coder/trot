@@ -203,9 +203,17 @@ def parse_naver_news(
 
     # 5. 본문 이미지 추출 (대표 사진 위주로 최대 2장만 안전하게 추출)
     image_urls = []
+    junk_url_keywords = [
+        'icon', 'logo', 'banner', 'button', 'ad.', 'blank', 'emoticon', 'btn_', 
+        'font', 'url', 'zoom', 'shop', 'widget', 'thefact', 'tf.co.kr', 'xports',
+        'symbol', 'ci_', 'favicon', 'avatar', 'starnews', 'newsen'
+    ]
+
     og_img = soup.find('meta', property='og:image')
     if og_img and og_img.get('content'):
-        image_urls.append(og_img.get('content'))
+        og_src = og_img.get('content')
+        if not any(x in og_src.lower() for x in junk_url_keywords):
+            image_urls.append(og_src)
 
     if article_content:
         for img in article_content.find_all('img'):
@@ -214,8 +222,8 @@ def parse_naver_news(
                 if not src.startswith('http'):
                     parsed_root = urlparse(url)
                     src = f"{parsed_root.scheme}://{parsed_root.netloc}/{src.lstrip('/')}"
-                # 광고, 쇼핑몰, 아이콘 등 엄격 차단
-                if not any(x in src.lower() for x in ['icon', 'logo', 'banner', 'button', 'ad.', 'blank', 'emoticon', 'btn_', 'font', 'url', 'zoom', 'shop', 'widget']):
+                # 언론사 로고, 광고, 쇼핑몰, 아이콘 등 엄격 차단
+                if not any(x in src.lower() for x in junk_url_keywords):
                     image_urls.append(src)
 
     # 중복 제거

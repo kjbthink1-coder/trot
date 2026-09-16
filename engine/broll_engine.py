@@ -236,7 +236,7 @@ def normalize_video_clip(
     vf_chain = (
         "scale=1080:1920:force_original_aspect_ratio=increase,"
         "crop=1080:1920,"
-        "format=yuv420p"
+        "format=yuv420p,setsar=1"
     )
 
     cmd = [
@@ -248,7 +248,7 @@ def normalize_video_clip(
         "-r", "30",
         "-c:v", "libx264",
         "-preset", "veryfast",
-        "-crf", "23",
+        "-video_track_timescale", "30000",
         "-an",  # Strip audio for zero copyright issues & zero TTS collision
         os.path.abspath(output_path)
     ]
@@ -621,6 +621,70 @@ def get_or_fetch_broll(
     
     logger.info(f"[B-roll Engine] No B-roll available for '{category}' and stock fallback is disabled. Returning None.")
     return None
+
+
+def get_or_fetch_broll_multiple(
+    category: str,
+    tag: Optional[str] = None,
+    count: int = 1,
+    target_duration: float = 3.5,
+    db_path: Optional[str] = None,
+    allow_stock_fallback: bool = True
+) -> List[str]:
+    """
+    Retrieves up to `count` non-duplicate B-roll video clip paths for the given category/tag.
+    Combines DB queries, API search, and fallback stock clips to return exact requested count.
+    """
+    if count <= 0:
+        return []
+    
+    ensure_broll_directories()
+    norm_cat = normalize_category_name(category)
+    norm_tag = tag.strip().lower() if tag else None
+
+    query_tags = [norm_cat]
+    if norm_tag:
+        query_tags.append(norm_tag)
+
+    results = []
+    seen = set()
+
+    # Step 1: Fetch all matching local clips from DB
+    local_clips = media_db.query_brolls(tags=query_tags, limit=count * 3, db_path=db_path)
+    for row in local_clips:
+        fpath = row.get("file_path")
+        if fpath and os.path.isfile(fpath) and fpath not in seen:
+            results.append(fpath)
+            seen.add(fpath)
+            if len(results) >= count:
+                return results[:count]
+
+    # Check category alone if tag was provided
+    if norm_tag and len(results) < count:
+        cat_clips = media_db.query_brolls(tags=[norm_cat], limit=count * 3, db_path=db_path)
+        for row in cat_clips:
+            fpath = row.get("file_path")
+            if fpath and os.path.isfile(fpath) and fpath not in seen:
+                results.append(fpath)
+                seen.add(fpath)
+                if len(results) >= count:
+                    return results[:count]
+
+    # Step 2: Try fetching via single clip retriever
+    if len(results) < count:
+        single = get_or_fetch_broll(category=category, tag=tag, target_duration=target_duration, db_path=db_path, allow_stock_fallback=False)
+        if single and os.path.isfile(single) and single not in seen:
+            results.append(single)
+            seen.add(single)
+
+    # Step 3: Fallback stock clip if needed to reach count
+    if len(results) < count and allow_stock_fallback:
+        stock = get_fallback_stock_video()
+        if stock and os.path.isfile(stock) and stock not in seen:
+            results.append(stock)
+            seen.add(stock)
+
+    return results[:count]
 
 
 def sync_broll_assets(db_path: Optional[str] = None) -> Dict[str, int]:
