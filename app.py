@@ -457,6 +457,13 @@ with main_tab_produce:
                         sub_size = st.slider("자막 크기", min_value=12, max_value=24, value=16, step=1, key="slider_sub")
                     with cc3:
                         sub_color = st.color_picker("자막 색상", value="#FFF000", key="picker_sub")
+                    
+                    sub_margin_v = st.slider(
+                        "↕️ 자막 세로 위치 (왼쪽: 아래로 ⬇️ / 오른쪽: 위로 ⬆️)",
+                        min_value=10, max_value=200, value=45, step=5,
+                        key="slider_sub_pos",
+                        help="왼쪽으로 올수록 자막이 아래로 내려가고, 오른쪽으로 밀수록 위로 올라갑니다."
+                    )
                     st.markdown('</div>', unsafe_allow_html=True)
 
                 if parsed["images"]:
@@ -815,7 +822,8 @@ with main_tab_produce:
                                 broll_video_paths=broll_clips_list,
                                 srt_path=srt_path,
                                 sub_font_size=sub_size,
-                                sub_color=sub_color
+                                sub_color=sub_color,
+                                sub_margin_v=sub_margin_v
                             )
                             st.session_state.rendered_video = video_path
                             st.success("쇼츠 영상 렌더링 성공! 영상 플레이어가 아래에 바로 준비되었습니다.")

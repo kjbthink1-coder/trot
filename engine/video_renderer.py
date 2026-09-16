@@ -179,6 +179,7 @@ def render_shorts_video(
     fps: int = 30,
     sub_font_size: int = 16,
     sub_color: str = "#FFF000",
+    sub_margin_v: int = 45,
     return_timeline: bool = False
 ) -> Union[str, tuple[str, list[dict]]]:
     """
@@ -474,8 +475,8 @@ def render_shorts_video(
         import shutil
         shutil.copy(os.path.abspath(srt_path), local_srt)
         ass_color = hex_to_ass_color(sub_color)
-        # 5070 시니어 맞춤 고대비 볼드 자막 스타일 (커스텀 크기/색상 + 블랙 두꺼운 테두리 + 하단 안전지대 MarginV=45 + WrapStyle=2로 복수 줄바꿈 원천 차단)
-        style = f"Fontname=Malgun Gothic,Fontsize={sub_font_size},Bold=1,PrimaryColour={ass_color},OutlineColour=&H00000000,BorderStyle=1,Outline=2.4,Shadow=1,Alignment=2,MarginV=45,WrapStyle=2"
+        # 5070 시니어 맞춤 고대비 볼드 자막 스타일 (커스텀 크기/색상 + 블랙 두꺼운 테두리 + 하단 안전지대 MarginV={sub_margin_v} + WrapStyle=2로 복수 줄바꿈 원천 차단)
+        style = f"Fontname=Malgun Gothic,Fontsize={sub_font_size},Bold=1,PrimaryColour={ass_color},OutlineColour=&H00000000,BorderStyle=1,Outline=2.4,Shadow=1,Alignment=2,MarginV={sub_margin_v},WrapStyle=2"
         vf_sub = ["-vf", f"subtitles=shorts_sub.srt:force_style='{style}'"]
 
     cmd_final = [
