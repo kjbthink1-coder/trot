@@ -251,36 +251,29 @@ def _crawl_external_singer_photos(
 
 # 한국 주요 트롯 가수별 공식 인스타그램 및 소속사 매핑 DB
 OFFICIAL_SINGER_MAP = {
-    "임영웅": {
-        "instagram": "limyoungwoong.official",
-        "agency": "물고기뮤직",
-        "keywords": ["limyoungwoong.official", "물고기뮤직", "공식 포스트"]
-    },
-    "박서진": {
-        "instagram": "parkseojin_official",
-        "agency": "포켓돌스튜디오",
-        "keywords": ["parkseojin_official", "포켓돌스튜디오", "공식 포스트"]
-    },
-    "김용빈": {
-        "instagram": "yongbin_official",
-        "agency": "김용빈 공식",
-        "keywords": ["yongbin_official", "공식 포스트"]
-    },
-    "이찬원": {
-        "instagram": "mee_woon_sani",
-        "agency": "스카이이엔엠",
-        "keywords": ["mee_woon_sani", "공식 포스트"]
-    },
-    "박지현": {
-        "instagram": "pjihyun_official",
-        "agency": "TN엔터테인먼트",
-        "keywords": ["pjihyun_official", "공식 포스트"]
-    },
-    "전유진": {
-        "instagram": "jeonyujin_official",
-        "agency": "전유진 공식",
-        "keywords": ["jeonyujin_official", "공식 포스트"]
-    }
+    "임영웅": {"instagram": "limyoungwoong.official", "agency": "물고기뮤직"},
+    "박서진": {"instagram": "parkseojin_official", "agency": "포켓돌스튜디오"},
+    "진해성": {"instagram": "jinhaeseong_official", "agency": "KDH엔터테인먼트"},
+    "영탁": {"instagram": "zerotak2", "agency": "어비스컴퍼니"},
+    "김용빈": {"instagram": "yongbin_official", "agency": "김용빈 공식"},
+    "이찬원": {"instagram": "mee_woon_sani", "agency": "스카이이엔엠"},
+    "박지현": {"instagram": "pjihyun_official", "agency": "TN엔터테인먼트"},
+    "전유진": {"instagram": "jeonyujin_official", "agency": "전유진 공식"},
+    "송가인": {"instagram": "songgain_", "agency": "포켓돌스튜디오"},
+    "양지은": {"instagram": "yangjieun90", "agency": "초록뱀이엔엠"},
+    "홍지윤": {"instagram": "hongjiyun_official", "agency": "생각엔터테인먼트"},
+    "정동원": {"instagram": "dongwon_13", "agency": "쇼플레이"},
+    "장민호": {"instagram": "jangminho7", "agency": "호엔터테인먼트"},
+    "김호중": {"instagram": "tvarotti_official", "agency": "생각엔터테인먼트"},
+    "손태진": {"instagram": "son_taejin", "agency": "미스틱스토리"},
+    "안성훈": {"instagram": "ash_ash0815", "agency": "생각엔터테인먼트"},
+    "신성": {"instagram": "shinsung_official", "agency": "뉴에라프로젝트"},
+    "에녹": {"instagram": "enoch_official", "agency": "EMK엔터테인먼트"},
+    "나상도": {"instagram": "sangdo_na", "agency": "JJ엔터테인먼트"},
+    "최수호": {"instagram": "suho_choi_official", "agency": "포켓돌스튜디오"},
+    "마이진": {"instagram": "myjin_official", "agency": "DB엔터테인먼트"},
+    "오유진": {"instagram": "oh_yujin_official", "agency": "토탈셋"},
+    "김희재": {"instagram": "heejae_official", "agency": "티엔엔터테인먼트"}
 }
 
 # 수집된 사진별 출처 메타데이터 세션 매핑 (file_path -> source_type)
@@ -321,13 +314,16 @@ def search_instagram_official_photos(
     existing_paths = existing_paths or set()
 
     handle_info = OFFICIAL_SINGER_MAP.get(singer_name, {})
-    insta_handle = handle_info.get("instagram", f"{singer_name}_official")
+    insta_handle = handle_info.get("instagram", "")
 
     queries = [
-        f"site:instagram.com {singer_name} 공식",
-        f"site:instagram.com/{insta_handle}",
-        f"site:instagram.com {singer_name} 콘서트 화보"
+        f"{singer_name} 인스타그램 공식",
+        f"{singer_name} 인스타 화보",
+        f"{singer_name} 공식 인스타",
+        f"{singer_name} 인스타 피드"
     ]
+    if insta_handle:
+        queries.insert(0, f"{singer_name} {insta_handle} 인스타그램")
 
     img_urls = []
     for q in queries:
@@ -337,7 +333,7 @@ def search_instagram_official_photos(
             d_html = urllib.request.urlopen(d_req, context=SSL_CTX, timeout=6).read().decode('utf-8', errors='ignore')
             matches = re.findall(r'https?://[a-zA-Z0-9_./-]+\.(?:jpg|jpeg|png)', d_html)
             for m in matches:
-                if any(k in m for k in ['cdninstagram', 'instagram', 'fbcdn', 'daumcdn', 'kakaocdn']) and m not in img_urls:
+                if not any(b in m.lower() for b in ['daum_og', 'favicon', 'logo', 'icon', 'btn_']) and m not in img_urls:
                     img_urls.append(m)
         except Exception:
             pass
@@ -365,7 +361,7 @@ def search_instagram_official_photos(
         except Exception:
             pass
 
-    logger.info(f"[Stage 1/5] 공식 인스타그램/SNS에서 '{singer_name}' 고화질 사진 {len(downloaded)}장 수집 완료.")
+    logger.info(f"[Stage 2/5] 공식 인스타그램/SNS에서 '{singer_name}' 고화질 사진 {len(downloaded)}장 수집 완료.")
     return downloaded
 
 
@@ -385,10 +381,12 @@ def search_agency_official_photos(
     agency_name = handle_info.get("agency", "")
 
     queries = [
-        f"site:post.naver.com {singer_name} {agency_name} 공식",
-        f"site:post.naver.com {singer_name} 비하인드 화보",
+        f"{singer_name} 네이버 포스트 공식",
+        f"{singer_name} 비하인드 화보",
         f"{singer_name} 소속사 공식 화보"
     ]
+    if agency_name:
+        queries.insert(0, f"{singer_name} {agency_name} 공식 화보")
 
     img_urls = []
     for q in queries:
@@ -398,7 +396,7 @@ def search_agency_official_photos(
             d_html = urllib.request.urlopen(d_req, context=SSL_CTX, timeout=6).read().decode('utf-8', errors='ignore')
             matches = re.findall(r'https?://[a-zA-Z0-9_./-]+\.(?:jpg|jpeg|png)', d_html)
             for m in matches:
-                if any(k in m for k in ['post-phinf', 'naver', 'daumcdn', 'kakaocdn']) and m not in img_urls:
+                if not any(b in m.lower() for b in ['daum_og', 'favicon', 'logo', 'icon', 'btn_']) and m not in img_urls:
                     img_urls.append(m)
         except Exception:
             pass
@@ -426,7 +424,7 @@ def search_agency_official_photos(
         except Exception:
             pass
 
-    logger.info(f"[Stage 2/5] 소속사 공식 채널에서 '{singer_name}' 고화질 사진 {len(downloaded)}장 수집 완료.")
+    logger.info(f"[Stage 3/5] 소속사 공식 채널에서 '{singer_name}' 고화질 사진 {len(downloaded)}장 수집 완료.")
     return downloaded
 
 

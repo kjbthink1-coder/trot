@@ -24,11 +24,10 @@ logger = logging.getLogger("qa.ai_reviewer")
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
-# Candidate models ordered by priority (gemini-flash-latest -> gemini-3.6-flash -> gemini-2.5-flash)
+# Candidate models ordered by priority
 CANDIDATE_GEMINI_MODELS = [
-    "gemini-flash-latest",
-    "gemini-3.6-flash",
-    "gemini-2.5-flash",
+    "gemini-1.5-flash",
+    "gemini-1.5-pro",
     "gemini-2.0-flash"
 ]
 
