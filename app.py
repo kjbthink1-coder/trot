@@ -23,7 +23,7 @@ from engine.clip_manager import (
     download_youtube_and_slice,
     delete_clip
 )
-from engine.media_db import get_media_stats, get_db_connection, compute_file_hash, update_media_file_hash
+from engine.media_db import get_media_stats, get_db_connection, compute_file_hash, update_media_file_hash, delete_media_record
 from engine.scene_analyzer import analyze_script_scenes
 from engine.broll_engine import get_or_fetch_broll
 from engine.qa import run_full_qa
@@ -564,33 +564,68 @@ with main_tab_produce:
 
             singer_cc_db_clips = get_db_singer_cc_clips(parsed['singer'], limit=10)
             if singer_cc_db_clips:
-                st.markdown(f"🗄️ **가수 라이브러리 DB 보유 클립 ({len(singer_cc_db_clips)}개)** — *오늘 쇼츠에 사용할 클립을 직접 체크(선택)하세요!*")
+                st.markdown(f"🗄️ **가수 라이브러리 DB 보유 클립 ({len(singer_cc_db_clips)}개)** — *원치 않는 영상은 '🗑️ DB 삭제'를 누르고, 사용할 영상만 체크하세요!*")
                 cols_cc_db = st.columns(min(4, len(singer_cc_db_clips)))
                 for c_idx, c_info in enumerate(singer_cc_db_clips):
                     fpath = c_info['file_path']
+                    cid = c_info.get('id', c_idx)
                     if os.path.exists(fpath):
                         with cols_cc_db[c_idx % 4]:
                             st.caption(f"📹 {c_info.get('video_title', 'CC Clip')[:18]}... ({c_info.get('clip_duration', 3.5):.1f}초)")
                             st.video(fpath)
-                            chk_key = f"chk_cc_{c_info.get('id', c_idx)}"
-                            is_checked = st.checkbox("✅ 오늘 쇼츠에 사용", value=True, key=chk_key)
                             
-                            cur_singer_sel = st.session_state.selected_cc_clips.get(parsed['singer'], [])
-                            if is_checked:
-                                if fpath not in cur_singer_sel:
-                                    cur_singer_sel.append(fpath)
-                            else:
-                                if fpath in cur_singer_sel:
-                                    cur_singer_sel.remove(fpath)
-                            st.session_state.selected_cc_clips[parsed['singer']] = cur_singer_sel
+                            c_c1, c_c2 = st.columns([1.6, 1])
+                            with c_c1:
+                                chk_key = f"chk_cc_{cid}"
+                                is_checked = st.checkbox("✅ 쇼츠에 사용", value=True, key=chk_key)
+                                cur_singer_sel = st.session_state.selected_cc_clips.get(parsed['singer'], [])
+                                if is_checked:
+                                    if fpath not in cur_singer_sel:
+                                        cur_singer_sel.append(fpath)
+                                else:
+                                    if fpath in cur_singer_sel:
+                                        cur_singer_sel.remove(fpath)
+                                st.session_state.selected_cc_clips[parsed['singer']] = cur_singer_sel
+                            with c_c2:
+                                if st.button("🗑️ 삭제", key=f"btn_del_db_cc_{cid}", help="이 클립을 DB 및 디스크에서 완전 삭제합니다."):
+                                    delete_media_record(cid)
+                                    time.sleep(0.3)
+                                    st.rerun()
 
-            col_cc_btn, col_cc_info = st.columns([1.5, 3])
-            with col_cc_btn:
-                if st.button(f"🔍 [{parsed['singer']}] YouTube CC 영상 5개 수집", key="btn_fetch_youtube_cc"):
+            col_cc_btn1, col_cc_btn2, col_cc_info = st.columns([1.5, 1.8, 2.5])
+            with col_cc_btn1:
+                if st.button(f"🔍 [{parsed['singer']}] CC 영상 5개 탐색", key="btn_fetch_youtube_cc"):
                     with st.spinner(f"YouTube에서 [{parsed['singer']}] Creative Commons 영상 탐색 중..."):
                         cc_results = search_youtube_cc_videos(parsed['singer'], max_results=5)
                         st.session_state.youtube_cc_candidates = cc_results
                         st.rerun()
+
+            cc_candidates = st.session_state.get("youtube_cc_candidates", [])
+            with col_cc_btn2:
+                if cc_candidates:
+                    if st.button(f"⚡ 5개 후보 모두 컷편집 & DB 저장", key="btn_trim_all_cc", type="primary"):
+                        with st.spinner(f"5개 CC 후보 영상을 설정한 구간/구도로 일괄 컷편집 & DB 저장 중..."):
+                            saved_cnt = 0
+                            for c_i, c_item in enumerate(cc_candidates):
+                                t_s = st.session_state.get(f"cc_start_{c_i}", 10.0)
+                                t_e = st.session_state.get(f"cc_end_{c_i}", min(c_item['original_duration'], t_s + 3.8))
+                                c_x = float(st.session_state.get(f"cc_crop_x_{c_i}", 50))
+                                try:
+                                    r_p = download_raw_cc_video(c_item["youtube_url"])
+                                    trim_and_normalize_cc_clip(
+                                        raw_video_path=r_p,
+                                        start_time=t_s,
+                                        end_time=t_e,
+                                        singer_name=parsed['singer'],
+                                        metadata=c_item,
+                                        crop_x_percent=c_x
+                                    )
+                                    saved_cnt += 1
+                                except Exception as e_batch:
+                                    print(f"Batch trim error candidate {c_i}: {e_batch}")
+                            st.success(f"🎉 총 {saved_cnt}개 CC 클립이 DB 보관함에 저장되었습니다!")
+                            time.sleep(0.5)
+                            st.rerun()
 
             cc_candidates = st.session_state.get("youtube_cc_candidates", [])
             if cc_candidates:

@@ -1236,6 +1236,46 @@ def get_recent_singer_projects(
         return projects
 
 
+def delete_media_record(
+    target: Union[int, str],
+    db_path: Optional[str] = None
+) -> bool:
+    """
+    Deletes a media item from media_library.db and removes the underlying file from disk.
+    target can be media_id (int) or file_path (str).
+    """
+    target_path = os.path.abspath(db_path or DEFAULT_DB_PATH)
+    if not os.path.exists(target_path):
+        return False
+
+    with get_db_connection(target_path) as conn:
+        cur = conn.cursor()
+        if isinstance(target, int) or (isinstance(target, str) and target.isdigit()):
+            mid = int(target)
+            cur.execute("SELECT id, file_path FROM media WHERE id = ?", (mid,))
+        else:
+            fpath = os.path.abspath(os.path.normpath(str(target)))
+            cur.execute("SELECT id, file_path FROM media WHERE file_path = ?", (fpath,))
+        
+        row = cur.fetchone()
+        if not row:
+            return False
+        
+        m_id = row["id"]
+        m_path = row["file_path"]
+
+        cur.execute("DELETE FROM media_tags WHERE media_id = ?", (m_id,))
+        cur.execute("DELETE FROM project_media WHERE media_id = ?", (m_id,))
+        cur.execute("DELETE FROM media WHERE id = ?", (m_id,))
+
+        if m_path and os.path.isfile(m_path):
+            try:
+                os.remove(m_path)
+            except Exception as e:
+                logger.warning(f"Could not remove file {m_path} from disk: {e}")
+        return True
+
+
 if __name__ == "__main__":
     print("=== Media DB Standalone Verification ===")
     test_db = os.path.join(PROJECT_ROOT, "test_media_library.db")
