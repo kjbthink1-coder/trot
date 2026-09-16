@@ -212,15 +212,26 @@ st.markdown("""
         display: block !important;
     }
 
-    /* 🎬 컴팩트 쇼츠 비디오 플레이어 (1/4 화면 사이즈 표시) */
-    .compact-video-box [data-testid="stVideo"],
-    .compact-video-box video {
-        max-width: 270px !important;
-        max-height: 480px !important;
+    /* 🎬 컴팩트 쇼츠 비디오 플레이어 (9:16 세로 영상 화면 거대화 방지) */
+    .compact-video-box,
+    div[data-testid="stVideo"] {
+        max-width: 250px !important;
+        max-height: 440px !important;
+        margin: 0 auto !important;
+    }
+
+    .compact-video-box video,
+    .compact-video-box iframe,
+    div[data-testid="stVideo"] video,
+    div[data-testid="stVideo"] iframe {
+        max-width: 250px !important;
+        max-height: 440px !important;
+        width: 100% !important;
+        height: auto !important;
         margin: 0 auto !important;
         display: block !important;
         border-radius: 12px !important;
-        box-shadow: 0 8px 24px rgba(15, 23, 42, 0.15) !important;
+        box-shadow: 0 6px 20px rgba(15, 23, 42, 0.15) !important;
     }
 
     .engine-badge {
@@ -567,14 +578,16 @@ with main_tab_produce:
             singer_cc_db_clips = get_db_singer_cc_clips(parsed['singer'], limit=10)
             if singer_cc_db_clips:
                 st.markdown(f"🗄️ **가수 라이브러리 DB 보유 클립 ({len(singer_cc_db_clips)}개)** — *원치 않는 영상은 '🗑️ DB 삭제'를 누르고, 사용할 영상만 체크하세요!*")
-                cols_cc_db = st.columns(min(4, len(singer_cc_db_clips)))
+                cols_cc_db = st.columns(4)
                 for c_idx, c_info in enumerate(singer_cc_db_clips):
                     fpath = c_info['file_path']
                     cid = c_info.get('id', c_idx)
                     if os.path.exists(fpath):
                         with cols_cc_db[c_idx % 4]:
                             st.caption(f"📹 {c_info.get('video_title', 'CC Clip')[:18]}... ({c_info.get('clip_duration', 3.5):.1f}초)")
+                            st.markdown('<div class="compact-video-box">', unsafe_allow_html=True)
                             st.video(fpath)
+                            st.markdown('</div>', unsafe_allow_html=True)
                             
                             c_c1, c_c2 = st.columns([1.6, 1])
                             with c_c1:
@@ -1194,11 +1207,13 @@ with main_tab_library:
                     c2.video(test_picks[1])
 
         st.write("")
-        # 3열 그리드로 클립 표시
-        cols = st.columns(3)
+        # 4열 그리드로 클립 표시
+        cols = st.columns(4)
         for idx, cp in enumerate(clips):
-            with cols[idx % 3]:
+            with cols[idx % 4]:
+                st.markdown('<div class="compact-video-box">', unsafe_allow_html=True)
                 st.video(cp)
+                st.markdown('</div>', unsafe_allow_html=True)
                 fsize = os.path.getsize(cp) / 1024
                 c_fname = os.path.basename(cp)
                 st.caption(f"클립 #{idx+1} ({fsize:.0f}KB)")
