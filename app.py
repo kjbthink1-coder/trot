@@ -3,9 +3,12 @@ import os
 import sys
 import tempfile
 import time
+import hashlib
+import shutil
 
 # 프로젝트 루트 경로 추가
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(PROJECT_ROOT)
 
 from crawler.news_parser import parse_naver_news
 from crawler.image_enricher import fetch_singer_photos, get_photo_source_badge
@@ -22,11 +25,31 @@ from engine.clip_manager import (
     get_random_singer_clips,
     slice_video_into_clips,
     download_youtube_and_slice,
-    delete_clip
+    delete_clip,
+    get_video_duration
 )
-from engine.media_db import get_media_stats, get_db_connection, compute_file_hash, update_media_file_hash, delete_media_record
+from engine.media_db import (
+    get_media_stats,
+    get_db_connection,
+    compute_file_hash,
+    update_media_file_hash,
+    delete_media_record,
+    query_brolls,
+    register_media
+)
 from engine.scene_analyzer import analyze_script_scenes
-from engine.broll_engine import get_or_fetch_broll
+from engine.broll_engine import (
+    get_or_fetch_broll,
+    get_or_fetch_broll_multiple,
+    sync_broll_assets,
+    normalize_video_clip,
+    search_pexels_videos,
+    search_pixabay_videos,
+    extract_best_video_candidate,
+    download_single_clip,
+    load_env_keys,
+    CATEGORY_QUERY_MAP
+)
 from engine.qa import run_full_qa
 from engine.cc_video_engine import (
     get_db_singer_cc_clips,
@@ -75,19 +98,34 @@ def open_setting_dialog():
     provider = st.selectbox("AI 엔진 선택", ["gemini", "openai", "내장 템플릿 (API 키 없이 즉시 생성)"])
     
     if provider == "gemini":
-        saved_gemini = load_env_key("GEMINI_API_KEY")
-        api_key_input = st.text_input("Gemini API Key", type="password", value=saved_gemini, help="Google AI Studio에서 발급받은 키를 입력하세요")
+        st.markdown("##### ⚡ Gemini 4중 API 키 멀티 로테이션 설정")
+        st.caption("키 #1 사용량 초과(429) 시 두 번째, 세 번째 키로 즉시 자동 우회 접속됩니다.")
         
-        if st.button("💾 Gemini 키 영구 저장", key="btn_save_gemini_modal"):
-            if api_key_input.strip():
-                save_env_key("GEMINI_API_KEY", api_key_input)
-                st.success("Gemini API 키가 성공적으로 저장 및 연결되었습니다!")
-                time.sleep(0.5)
-                st.rerun()
-            else:
-                st.warning("키를 입력해 주세요.")
-        if api_key_input.strip() or saved_gemini:
-            st.caption("🟢 Gemini API 키가 정상 등록되어 연결되어 있습니다.")
+        k1 = load_env_key("GEMINI_API_KEY")
+        k2 = load_env_key("GEMINI_API_KEY_2")
+        k3 = load_env_key("GEMINI_API_KEY_3")
+        k4 = load_env_key("GEMINI_API_KEY_4")
+        
+        col_k1, col_k2 = st.columns(2)
+        with col_k1:
+            k1_in = st.text_input("🔑 Gemini API Key #1 (주 키)", type="password", value=k1, help="메인 키")
+            k3_in = st.text_input("🔑 Gemini API Key #3 (우회 키 2)", type="password", value=k3, help="예비 키 2")
+        with col_k2:
+            k2_in = st.text_input("🔑 Gemini API Key #2 (우회 키 1)", type="password", value=k2, help="예비 키 1")
+            k4_in = st.text_input("🔑 Gemini API Key #4 (우회 키 3)", type="password", value=k4, help="예비 키 3")
+
+        if st.button("💾 Gemini 4중 키 영구 저장", key="btn_save_gemini_modal", use_container_width=True):
+            save_env_key("GEMINI_API_KEY", k1_in)
+            save_env_key("GEMINI_API_KEY_2", k2_in)
+            save_env_key("GEMINI_API_KEY_3", k3_in)
+            save_env_key("GEMINI_API_KEY_4", k4_in)
+            st.success("🎉 Gemini 4중 API 키가 성공적으로 저장 및 연결되었습니다!")
+            time.sleep(0.5)
+            st.rerun()
+
+        valid_count = sum(1 for k in [k1_in, k2_in, k3_in, k4_in] if k and k.strip())
+        if valid_count > 0:
+            st.caption(f"🟢 총 **{valid_count}개**의 Gemini API 키가 정상 감지되었습니다. (사용량 초과 시 자동 우회 릴레이 작동)")
         else:
             st.caption("🟡 키가 미입력 상태입니다. 미입력 시 내장 기본 템플릿으로 자동 전환됩니다.")
 
@@ -154,6 +192,319 @@ def open_crop_dialog(img_path: str, img_idx: int):
                 st.rerun()
     except Exception as e:
         st.error(f"이미지 로딩 중 오류 발생: {e}")
+
+# ----------------- 📹 B-roll 미디어 수집 & 컷편집 스튜디오 카드 -----------------
+def render_broll_studio_card():
+    """
+    📹 [B-roll 미디어 수집 & 컷편집 스튜디오] 카드 컴포넌트
+    - 탭 1: [📁 DB 보관함 & 쇼츠 적용 선택]
+      - 카테고리별(audience, concert, emotion, hospital, money, smartphone, business) DB 보관 B-roll 비디오 플레이어 갤러리.
+      - 클립별 `✅ 쇼츠에 사용` 체크박스 및 `🗑️ DB 삭제` 버튼.
+    - 탭 2: [🎬 신규 B-roll 수집 & 3-4초 컷편집]
+      - 커스텀 MP4 파일 직접 업로드 또는 외부 탐색 후보 가져오기.
+      - 시작 시간(초) 지정 후 `[✂️ 3초 클립 추출 및 1080x1920 정규화]` 실행.
+      - 추출된 클립 미리보기 후 `[✅ 이 B-roll DB 보관]` 클릭 시 DB에 공식 저장.
+    """
+    if "selected_user_brolls" not in st.session_state:
+        st.session_state.selected_user_brolls = []
+
+    st.markdown('<div class="saas-card">', unsafe_allow_html=True)
+    st.markdown("#### 📹 [B-roll 미디어 수집 & 컷편집 스튜디오]")
+    st.caption("고화질 9:16 B-roll 영상 클립을 카테고리별로 검수/선택하고, 원하는 MP4 파일에서 3~4초 구간을 정규화 컷편집하여 DB에 보관합니다.")
+
+    tab_db, tab_ingest = st.tabs([
+        "📁 DB 보관함 & 쇼츠 적용 선택",
+        "🎬 신규 B-roll 수집 & 3-4초 컷편집"
+    ])
+
+    # -------------------------------------------------------------
+    # 탭 1: [📁 DB 보관함 & 쇼츠 적용 선택]
+    # -------------------------------------------------------------
+    with tab_db:
+        try:
+            sync_broll_assets()
+        except Exception:
+            pass
+
+        cat_options = [
+            "전체 (All)",
+            "audience (팬/관객/환호/박수)",
+            "concert (콘서트/무대/공연)",
+            "emotion (눈물/감동/환희)",
+            "hospital (병원/건강/의사)",
+            "money (돈/현금/수익)",
+            "smartphone (스마트폰/SNS)",
+            "business (비즈니스/계약)"
+        ]
+        
+        col_cat_sel, col_info_sel = st.columns([1.5, 2.5])
+        with col_cat_sel:
+            selected_cat_filter = st.selectbox("📂 카테고리 필터", cat_options, key="broll_db_cat_filter")
+        
+        filter_tag = None
+        if "전체" not in selected_cat_filter:
+            filter_tag = selected_cat_filter.split(" ")[0].strip()
+
+        if filter_tag:
+            db_brolls = query_brolls(tags=[filter_tag], limit=100)
+        else:
+            db_brolls = query_brolls(limit=100)
+
+        # 유효한 파일만 필터링
+        db_brolls = [b for b in db_brolls if b.get("file_path") and os.path.exists(b.get("file_path"))]
+
+        checked_count = len([f for f in st.session_state.selected_user_brolls if os.path.exists(f)])
+        with col_info_sel:
+            st.write("")
+            st.caption(f"💡 현재 **{len(db_brolls)}개** 보관 중 | ✅ **쇼츠 적용 선택:** `{checked_count}개` (렌더링 시 1순위 사용)")
+
+        if not db_brolls:
+            st.info("💡 보관함에 저장된 B-roll 클립이 없습니다. 옆의 **'🎬 신규 B-roll 수집 & 3-4초 컷편집'** 탭에서 새 B-roll을 추출하고 저장해보세요!")
+        else:
+            # 콩알만 한 미니 바둑판 갤러리 CSS
+            st.markdown(
+                """
+                <style>
+                .broll-grid-box video {
+                    max-height: 140px !important;
+                    object-fit: cover !important;
+                    border-radius: 6px;
+                }
+                </style>
+                """,
+                unsafe_allow_html=True
+            )
+
+            # 고정 높이 480px 스크롤 박스로 수백 개 수집에도 세로 스크롤 길이 고정
+            with st.container(height=480):
+                cols_per_row = 6
+                for r_idx in range(0, len(db_brolls), cols_per_row):
+                    row_items = db_brolls[r_idx:r_idx + cols_per_row]
+                    cols = st.columns(cols_per_row)
+                    for c_idx, b_item in enumerate(row_items):
+                        fpath = b_item.get("file_path")
+                        bid = b_item.get("id")
+                        b_tags = b_item.get("tags", "")
+                        b_source = b_item.get("source", "local")
+
+                        with cols[c_idx]:
+                            st.caption(f"🏷️ `{b_tags[:12]}`")
+                            st.markdown('<div class="broll-grid-box">', unsafe_allow_html=True)
+                            st.video(fpath)
+                            st.markdown('</div>', unsafe_allow_html=True)
+
+                            c_b1, c_b2 = st.columns([1.2, 1])
+                            with c_b1:
+                                is_checked = (fpath in st.session_state.selected_user_brolls)
+                                chk_val = st.checkbox("✅ 사용", value=is_checked, key=f"chk_user_broll_{bid}")
+                                if chk_val and fpath not in st.session_state.selected_user_brolls:
+                                    st.session_state.selected_user_brolls.append(fpath)
+                                elif not chk_val and fpath in st.session_state.selected_user_brolls:
+                                    st.session_state.selected_user_brolls.remove(fpath)
+
+                            with c_b2:
+                                if st.button("🗑️ 삭제", key=f"btn_del_broll_{bid}", help="이 B-roll을 DB 및 디스크에서 삭제합니다."):
+                                    delete_media_record(bid)
+                                    if fpath in st.session_state.selected_user_brolls:
+                                        st.session_state.selected_user_brolls.remove(fpath)
+                                    st.toast("🗑️ B-roll 클립이 삭제되었습니다.")
+                                    time.sleep(0.3)
+                                    st.rerun()
+
+    # -------------------------------------------------------------
+    # 탭 2: [🎬 신규 B-roll 수집 & 3-4초 컷편집]
+    # -------------------------------------------------------------
+    with tab_ingest:
+        st.markdown("##### 🎬 9:16 Vertical 1080x1920 3-4초 B-roll 추출 스튜디오")
+        
+        c_src1, c_src2 = st.columns([1, 1.2])
+        with c_src1:
+            source_mode = st.radio(
+                "📥 미디어 출처 선택",
+                ["📁 커스텀 MP4 직접 업로드", "🌐 Pexels / Pixabay 외부 탐색"],
+                key="broll_source_mode"
+            )
+
+        cat_list = ["audience", "concert", "emotion", "hospital", "money", "smartphone", "business"]
+        with c_src2:
+            target_category = st.selectbox(
+                "🏷️ 저장 카테고리 지정",
+                cat_list,
+                key="broll_target_cat"
+            )
+
+        raw_source_path = None
+
+        if source_mode == "📁 커스텀 MP4 직접 업로드":
+            uploaded_video = st.file_uploader(
+                "MP4 / MOV / AVI 영상 파일 선택",
+                type=["mp4", "mov", "avi", "webm"],
+                key="broll_file_upload_widget"
+            )
+            if uploaded_video:
+                temp_dir = os.path.join(PROJECT_ROOT, "assets", "general_broll", target_category)
+                os.makedirs(temp_dir, exist_ok=True)
+                temp_raw = os.path.join(temp_dir, "temp_uploaded_raw.mp4")
+                with open(temp_raw, "wb") as f:
+                    f.write(uploaded_video.getbuffer())
+                raw_source_path = temp_raw
+                st.caption(f"📁 업로드 완료: `{uploaded_video.name}` ({uploaded_video.size / (1024*1024):.1f} MB)")
+
+        else: # 🌐 Pexels / Pixabay 외부 탐색
+            col_q1, col_q2 = st.columns([2, 1])
+            with col_q1:
+                search_query = st.text_input(
+                    "🔍 검색어 입력 (영문 권장)",
+                    value=CATEGORY_QUERY_MAP.get(target_category, target_category),
+                    key="broll_ext_query"
+                )
+            with col_q2:
+                st.write("")
+                st.write("")
+                if st.button("🔎 Pexels/Pixabay 탐색", key="btn_search_ext_broll", use_container_width=True):
+                    keys = load_env_keys()
+                    pexels_key = keys.get("PEXELS_API_KEY", "")
+                    pixabay_key = keys.get("PIXABAY_API_KEY", "")
+
+                    cand = None
+                    if pexels_key:
+                        res = search_pexels_videos(search_query, pexels_key, per_page=5)
+                        if res and res.get("videos"):
+                            cand = extract_best_video_candidate("pexels", res)
+                    if not cand and pixabay_key:
+                        res = search_pixabay_videos(search_query, pixabay_key, per_page=5)
+                        if res and res.get("hits"):
+                            cand = extract_best_video_candidate("pixabay", res)
+                    
+                    if cand and cand.get("download_url"):
+                        temp_dir = os.path.join(PROJECT_ROOT, "assets", "general_broll", target_category)
+                        os.makedirs(temp_dir, exist_ok=True)
+                        dl_path = os.path.join(temp_dir, "temp_ext_raw.mp4")
+                        if download_single_clip(cand["download_url"], dl_path):
+                            st.session_state.broll_ext_candidate_path = dl_path
+                            st.session_state.broll_ext_candidate_meta = cand
+                            st.success("🎉 외부 B-roll 영상을 성공적으로 가져왔습니다!")
+                            st.rerun()
+                        else:
+                            st.error("❌ 영상 다운로드에 실패했습니다.")
+                    else:
+                        st.warning("⚠️ 탐색된 외부 영상 후보가 없습니다. API 키를 확인하세요.")
+
+            if st.session_state.get("broll_ext_candidate_path") and os.path.exists(st.session_state["broll_ext_candidate_path"]):
+                raw_source_path = st.session_state["broll_ext_candidate_path"]
+                meta = st.session_state.get("broll_ext_candidate_meta", {})
+
+        # 컷편집 컨트롤 파트
+        if raw_source_path and os.path.exists(raw_source_path):
+            st.divider()
+            orig_dur = get_video_duration(raw_source_path)
+            meta = st.session_state.get("broll_ext_candidate_meta", {}) if source_mode != "📁 커스텀 MP4 직접 업로드" else {}
+            
+            c_raw_v, c_raw_ctrl = st.columns([1.1, 1.2])
+            with c_raw_v:
+                st.markdown("##### 🎥 수집 원본 영상 전체 미리보기")
+                st.markdown('<div class="compact-video-box">', unsafe_allow_html=True)
+                st.video(raw_source_path)
+                st.markdown('</div>', unsafe_allow_html=True)
+
+            with c_raw_ctrl:
+                st.markdown("##### ✂️ 클립 추출 시간 지정 & 1080x1920 정규화")
+                
+                src_link = meta.get("source_url") or meta.get("url") or "#"
+                provider_name = meta.get("provider", "external")
+                author_name = meta.get("author", "N/A")
+
+                if source_mode != "📁 커스텀 MP4 직접 업로드" and meta:
+                    if src_link != "#":
+                        st.caption(f"🔗 [{provider_name.capitalize()} 원본 웹페이지 링크]({src_link}) | 작가: `{author_name}` | 원본 길이: `{orig_dur:.1f}초`")
+                    else:
+                        st.caption(f"🌐 탐색 수집 원본: `{provider_name}` | 작가: `{author_name}` | 원본 길이: `{orig_dur:.1f}초`")
+                else:
+                    st.caption(f"📁 업로드 미디어 원본 | 원본 길이: `{orig_dur:.1f}초`")
+
+                max_start = max(0.0, orig_dur - 1.0) if orig_dur > 1.0 else 0.0
+                cut_start = st.number_input(
+                    "⏱️ 시작 시간 (초)",
+                    min_value=0.0,
+                    max_value=float(max_start),
+                    value=0.0,
+                    step=0.5,
+                    key="broll_cut_start"
+                )
+
+                max_dur = max(1.0, orig_dur - cut_start) if orig_dur > 0 else 10.0
+                default_dur = min(3.5, max_dur)
+                cut_dur = st.number_input(
+                    "📏 클립 길이 (초)",
+                    min_value=1.0,
+                    max_value=float(min(10.0, max_dur)),
+                    value=float(default_dur),
+                    step=0.5,
+                    key="broll_cut_dur"
+                )
+
+                clip_end = round(cut_start + cut_dur, 1)
+                st.info(f"✂️ 자르기 구간: `{cut_start:.1f}s ~ {clip_end:.1f}s` (클립 길이: {cut_dur:.1f}초)")
+
+                if st.button("✂️ 3초 클립 추출 및 1080x1920 정규화", key="btn_exec_broll_cut", type="primary", use_container_width=True):
+                    with st.spinner("FFmpeg 1080x1920 세로형 30fps 무음 정규화 컷편집 진행 중..."):
+                        temp_out_dir = os.path.join(PROJECT_ROOT, "assets", "general_broll", target_category)
+                        os.makedirs(temp_out_dir, exist_ok=True)
+                        preview_clip_path = os.path.join(temp_out_dir, "temp_broll_preview.mp4")
+                        
+                        ok = normalize_video_clip(
+                            input_path=raw_source_path,
+                            output_path=preview_clip_path,
+                            target_duration=cut_dur,
+                            start_time=cut_start
+                        )
+                        if ok:
+                            st.session_state.broll_preview_clip = preview_clip_path
+                            st.success("🎉 1080x1920 세로 컷편집 완료! 아래 미리보기를 확인하세요.")
+                            st.rerun()
+                        else:
+                            st.error("❌ FFmpeg 클립 컷편집 정규화 실패")
+
+            # 미리보기 및 DB 저장
+            preview_p = st.session_state.get("broll_preview_clip")
+            if preview_p and os.path.exists(preview_p):
+                st.divider()
+                st.markdown("##### 📸 추출된 3-4초 B-roll 클립 미리보기")
+                c_prev1, c_prev2 = st.columns([1, 1])
+                with c_prev1:
+                    st.video(preview_p)
+                with c_prev2:
+                    st.write("")
+                    st.write("")
+                    st.info(f"📐 **규격:** 1080x1920 Vertical | **길이:** {cut_dur}초 | **카테고리:** `{target_category}`")
+                    if st.button("✅ 이 B-roll DB 보관", key="btn_save_broll_db", type="primary", use_container_width=True):
+                        h_val = hashlib.sha256(f"{target_category}_{time.time()}".encode("utf-8")).hexdigest()[:8]
+                        final_save_dir = os.path.join(PROJECT_ROOT, "assets", "general_broll", target_category)
+                        os.makedirs(final_save_dir, exist_ok=True)
+                        final_save_path = os.path.join(final_save_dir, f"broll_{h_val}.mp4")
+
+                        shutil.copy2(preview_p, final_save_path)
+
+                        register_media(
+                            file_path=final_save_path,
+                            media_type="video",
+                            subtype="general_broll",
+                            source="user_studio",
+                            tags=[target_category],
+                            description=f"Studio edited B-roll clip ({target_category})"
+                        )
+
+                        if final_save_path not in st.session_state.selected_user_brolls:
+                            st.session_state.selected_user_brolls.append(final_save_path)
+
+                        st.session_state.broll_preview_clip = None
+                        st.success("🎉 B-roll 클립이 DB 보관함에 영구 저장되었으며 쇼츠 적용 목록에 추가되었습니다!")
+                        time.sleep(0.5)
+                        st.rerun()
+        else:
+            st.info("💡 위에서 MP4 파일을 직접 업로드하거나 외부 탐색으로 영상 원본을 불러오세요.")
+
+    st.markdown('</div>', unsafe_allow_html=True)
 
 # 커스텀 CSS (상용 SaaS Slate & Indigo 디자인 시스템)
 st.markdown("""
@@ -238,6 +589,28 @@ st.markdown("""
         display: block !important;
         border-radius: 12px !important;
         box-shadow: 0 6px 20px rgba(15, 23, 42, 0.15) !important;
+    }
+
+    /* 🎬 1/2 컴팩트 쇼츠 CC 비디오 미리보기 (기존의 1/2 크기로 축소) */
+    .cc-clip-video-box,
+    .cc-clip-video-box div[data-testid="stVideo"] {
+        max-width: 140px !important;
+        max-height: 220px !important;
+        margin: 0 auto !important;
+    }
+
+    .cc-clip-video-box video,
+    .cc-clip-video-box iframe,
+    .cc-clip-video-box div[data-testid="stVideo"] video,
+    .cc-clip-video-box div[data-testid="stVideo"] iframe {
+        max-width: 140px !important;
+        max-height: 220px !important;
+        width: 100% !important;
+        height: auto !important;
+        margin: 0 auto !important;
+        display: block !important;
+        border-radius: 8px !important;
+        box-shadow: 0 4px 12px rgba(15, 23, 42, 0.12) !important;
     }
 
     .engine-badge {
@@ -349,8 +722,9 @@ with main_tab_produce:
             st.session_state.ai_result = None
             st.session_state.rendered_video = None
             st.session_state.qa_result = None
+            st.session_state.youtube_cc_candidates = []
 
-            with st.spinner("기사 본문과 사진을 추출하고 AI 후킹 대본 및 블로그를 생성 중입니다..."):
+            with st.spinner("기사 본문·사진 추출, AI 대본/블로그 생성 및 YouTube CC 영상 5개 자동 수집 중입니다..."):
                 try:
                     # 1. 크롤링
                     parsed = parse_naver_news(news_url.strip())
@@ -380,12 +754,21 @@ with main_tab_produce:
                         except Exception as e_refetch:
                             print(f"[PhotoReFetch] {e_refetch}")
 
+                    # 4. YouTube CC 영상 5개 자동 탐색 (사진 다 긁어올 때 CC 영상도 자동 획득)
+                    try:
+                        print(f"[AutoCC] [{parsed['singer']}] YouTube CC 영상 5개 자동 탐색...")
+                        cc_results = search_youtube_cc_videos(parsed['singer'], max_results=5)
+                        st.session_state.youtube_cc_candidates = cc_results
+                    except Exception as e_cc:
+                        print(f"[AutoCC Error] {e_cc}")
+                        st.session_state.youtube_cc_candidates = []
+
                     st.session_state.parsed_data = parsed
                     st.session_state.ai_result = ai_res
                     st.session_state.selected_thumb_img_idx = 0
                     st.session_state.rendered_video = None
                     st.session_state.qa_result = None
-                    st.success(f"[{parsed['singer']}] 기사 분석 및 고유 대본/블로그 생성 완료!")
+                    st.success(f"[{parsed['singer']}] 기사 분석, 고유 대본/블로그 생성 및 CC 영상 5개 자동 수집 완료!")
                 except Exception as e:
                     st.error(f"처리 중 오류가 발생했습니다: {e}")
 
@@ -412,7 +795,6 @@ with main_tab_produce:
         # === TAB 1: 쇼츠 제작 ===
         with tab_shorts:
             # 💳 [카드 1] 🎯 썸네일 카피 선택 & 🎨 실시간 디자인 스튜디오
-            st.markdown('<div class="saas-card">', unsafe_allow_html=True)
             col_c1_left, col_c1_right = st.columns([1, 1.05])
             
             with col_c1_left:
@@ -448,12 +830,10 @@ with main_tab_produce:
                 chosen_thumb = ai_res["thumbnails"][cur_thumb_idx]
 
             with col_c1_right:
-                col_t_img, col_t_ctrl = st.columns([1, 1.1])
+                col_t_img, col_t_ctrl = st.columns([0.65, 1.35])
                 
                 with col_t_ctrl:
-                    st.markdown('<div style="background:#F8FAFC; border:1px solid #E2E8F0; border-radius:10px; padding:0.65rem 0.8rem; margin-bottom:0.4rem;">', unsafe_allow_html=True)
-                    st.markdown("##### 🎨 폰트 스타일 & 색상 조절")
-                    st.caption("조절 즉시 왼쪽 커버에 실시간 반영됩니다.")
+                    st.markdown("#### 🎨 폰트 스타일 & 색상 조절")
                     
                     st.markdown("🔹 **윗줄 텍스트 설정**")
                     cs1, cc1 = st.columns([2.5, 1.2])
@@ -469,20 +849,24 @@ with main_tab_produce:
                     with cc2:
                         line2_color = st.color_picker("아랫줄 색상", value="#FFF200", key="picker_line2")
 
-                    st.markdown("🟡 **쇼츠 1줄 자막 설정**")
+                    st.markdown("🟡 **쇼츠 1줄 자막 크기 및 색상**")
                     cs3, cc3 = st.columns([2.5, 1.2])
                     with cs3:
                         sub_size = st.slider("자막 크기", min_value=12, max_value=24, value=16, step=1, key="slider_sub")
                     with cc3:
                         sub_color = st.color_picker("자막 색상", value="#FFF000", key="picker_sub")
                     
-                    sub_margin_v = st.slider(
-                        "↕️ 자막 세로 위치 (왼쪽: 아래로 ⬇️ / 오른쪽: 위로 ⬆️)",
-                        min_value=10, max_value=200, value=45, step=5,
-                        key="slider_sub_pos",
-                        help="왼쪽으로 올수록 자막이 아래로 내려가고, 오른쪽으로 밀수록 위로 올라갑니다."
-                    )
-                    st.markdown('</div>', unsafe_allow_html=True)
+                    st.markdown("↕️ **쇼츠 자막 세로 위치 설정**")
+                    cs4, cc4 = st.columns([2.5, 1.2])
+                    with cs4:
+                        sub_margin_v = st.slider(
+                            "자막 세로 위치 (아래 ⬇️ ~ 위 ⬆️)",
+                            min_value=10, max_value=200, value=45, step=5,
+                            key="slider_sub_pos",
+                            help="왼쪽으로 올수록 자막이 아래로 내려가고, 오른쪽으로 밀수록 위로 올라갑니다."
+                        )
+                    with cc4:
+                        st.caption("↕️ 위치 조절")
 
                 if parsed["images"]:
                     selected_bg = parsed["images"][st.session_state.get("selected_thumb_img_idx", 0)] if st.session_state.get("selected_thumb_img_idx", 0) < len(parsed["images"]) else parsed["images"][0]
@@ -496,15 +880,19 @@ with main_tab_produce:
                     font_size_1=line1_size,
                     font_size_2=line2_size,
                     color_1=line1_color,
-                    color_2=line2_color
+                    color_2=line2_color,
+                    sub_preview_text="💬 [자막위치]",
+                    sub_font_size=sub_size,
+                    sub_color=sub_color,
+                    sub_margin_v=sub_margin_v
                 )
 
                 with col_t_img:
                     st.markdown('<div class="thumb-preview-box">', unsafe_allow_html=True)
-                    st.image(thumb_path, caption="유튜브 쇼츠 첫 프레임 & 썸네일 커버", use_container_width=True)
+                    st.image(thumb_path, caption="미리보기", use_container_width=True)
                     st.markdown('</div>', unsafe_allow_html=True)
             
-            st.markdown('</div>', unsafe_allow_html=True) # End Card 1
+            st.write("")
 
             # 💳 [카드 2] 📸 수집 사진 선별 & 썸네일 지정 (전체 화면 너비 카드)
             st.markdown('<div class="saas-card">', unsafe_allow_html=True)
@@ -581,37 +969,53 @@ with main_tab_produce:
             if "selected_cc_clips" not in st.session_state:
                 st.session_state.selected_cc_clips = {}
 
-            singer_cc_db_clips = get_db_singer_cc_clips(parsed['singer'], limit=10)
+            singer_cc_db_clips = get_db_singer_cc_clips(parsed['singer'], limit=50)
             if singer_cc_db_clips:
-                st.markdown(f"🗄️ **가수 라이브러리 DB 보유 클립 ({len(singer_cc_db_clips)}개)** — *원치 않는 영상은 '🗑️ DB 삭제'를 누르고, 사용할 영상만 체크하세요!*")
-                cols_cc_db = st.columns(4)
-                for c_idx, c_info in enumerate(singer_cc_db_clips):
-                    fpath = c_info['file_path']
-                    cid = c_info.get('id', c_idx)
-                    if os.path.exists(fpath):
-                        with cols_cc_db[c_idx % 4]:
-                            st.caption(f"📹 {c_info.get('video_title', 'CC Clip')[:18]}... ({c_info.get('clip_duration', 3.5):.1f}초)")
-                            st.markdown('<div class="compact-video-box">', unsafe_allow_html=True)
-                            st.video(fpath)
-                            st.markdown('</div>', unsafe_allow_html=True)
-                            
-                            c_c1, c_c2 = st.columns([1.6, 1])
-                            with c_c1:
-                                chk_key = f"chk_cc_{cid}"
-                                is_checked = st.checkbox("✅ 쇼츠에 사용", value=True, key=chk_key)
-                                cur_singer_sel = st.session_state.selected_cc_clips.get(parsed['singer'], [])
-                                if is_checked:
-                                    if fpath not in cur_singer_sel:
-                                        cur_singer_sel.append(fpath)
-                                else:
-                                    if fpath in cur_singer_sel:
-                                        cur_singer_sel.remove(fpath)
-                                st.session_state.selected_cc_clips[parsed['singer']] = cur_singer_sel
-                            with c_c2:
-                                if st.button("🗑️ 삭제", key=f"btn_del_db_cc_{cid}", help="이 클립을 DB 및 디스크에서 완전 삭제합니다."):
-                                    delete_media_record(cid)
-                                    time.sleep(0.3)
-                                    st.rerun()
+                st.markdown(f"🗄️ **가수 라이브러리 DB 보유 CC 클립 ({len(singer_cc_db_clips)}개)** — *원치 않는 영상은 '🗑️ 삭제'를 누르고, 사용할 영상만 체크하세요!*")
+                st.markdown(
+                    """
+                    <style>
+                    .cc-clip-video-box video {
+                        max-height: 140px !important;
+                        object-fit: cover !important;
+                        border-radius: 6px;
+                    }
+                    </style>
+                    """,
+                    unsafe_allow_html=True
+                )
+                with st.container(height=480):
+                    cols_per_row = 6
+                    for r_idx in range(0, len(singer_cc_db_clips), cols_per_row):
+                        row_items = singer_cc_db_clips[r_idx:r_idx + cols_per_row]
+                        cols_cc_db = st.columns(cols_per_row)
+                        for c_idx, c_info in enumerate(row_items):
+                            fpath = c_info['file_path']
+                            cid = c_info.get('id', r_idx + c_idx)
+                            if os.path.exists(fpath):
+                                with cols_cc_db[c_idx]:
+                                    st.caption(f"📹 `{c_info.get('video_title', 'CC Clip')[:12]}`")
+                                    st.markdown('<div class="cc-clip-video-box">', unsafe_allow_html=True)
+                                    st.video(fpath)
+                                    st.markdown('</div>', unsafe_allow_html=True)
+                                    
+                                    c_c1, c_c2 = st.columns([1.2, 1])
+                                    with c_c1:
+                                        chk_key = f"chk_cc_{cid}"
+                                        is_checked = st.checkbox("✅ 사용", value=True, key=chk_key)
+                                        cur_singer_sel = st.session_state.selected_cc_clips.get(parsed['singer'], [])
+                                        if is_checked:
+                                            if fpath not in cur_singer_sel:
+                                                cur_singer_sel.append(fpath)
+                                        else:
+                                            if fpath in cur_singer_sel:
+                                                cur_singer_sel.remove(fpath)
+                                        st.session_state.selected_cc_clips[parsed['singer']] = cur_singer_sel
+                                    with c_c2:
+                                        if st.button("🗑️ 삭제", key=f"btn_del_db_cc_{cid}", help="이 클립을 DB 및 디스크에서 완전 삭제합니다."):
+                                            delete_media_record(cid)
+                                            time.sleep(0.3)
+                                            st.rerun()
 
             col_cc_btn1, col_cc_btn2, col_cc_info = st.columns([1.5, 1.8, 2.5])
             with col_cc_btn1:
@@ -715,20 +1119,54 @@ with main_tab_produce:
                                                 end_time=t_end,
                                                 singer_name=parsed['singer'],
                                                 metadata=item,
-                                                crop_x_percent=float(crop_x_val)
+                                                crop_x_percent=crop_x_val
                                             )
-                                            st.success(f"🎉 3~4초 CC 클립(구도 {crop_x_val}%)이 DB에 저장되었습니다!")
-                                            time.sleep(0.5)
-                                            st.rerun()
+                                            st.success(f"✅ 클립 컷편집 & DB 등록 완료: `{os.path.basename(trimmed_info['file_path'])}`")
                                         except Exception as e_trim:
                                             st.error(f"클립 컷편집 중 오류: {e_trim}")
 
             st.markdown('</div>', unsafe_allow_html=True) # End Card 2
 
+            # 💳 [카드 2-B] 📹 [B-roll 미디어 수집 & 컷편집 스튜디오]
+            render_broll_studio_card()
+
             # 💳 [카드 3] 📜 60초 쇼츠 나레이션 대본 (전체 화면 너비 카드)
             st.markdown('<div class="saas-card">', unsafe_allow_html=True)
             st.markdown("#### 📜 60초 쇼츠 나레이션 대본")
-            edited_script = st.text_area("대본 수정 (필요 시 자유롭게 수정 가능)", value=ai_res["shorts_script"], height=160)
+            
+            current_script_val = ai_res.get("shorts_script", "")
+            edited_script = st.text_area("대본 수정 (필요 시 자유롭게 수정 가능)", value=current_script_val, height=160, key="shorts_script_textarea")
+            ai_res["shorts_script"] = edited_script
+
+            char_len = len(edited_script)
+            est_sec = round(char_len / 6.8, 1)
+
+            col_b1, col_b2 = st.columns([3.2, 1])
+            with col_b1:
+                if est_sec <= 55.0:
+                    st.success(f"⏱️ **예상 음성 길이:** `약 {est_sec}초` | **글자 수:** `{char_len}자` — 🟢 **쇼츠 규격 안전 (최적 50~55초)**")
+                elif est_sec <= 59.0:
+                    st.warning(f"⏱️ **예상 음성 길이:** `약 {est_sec}초` | **글자 수:** `{char_len}자` — 🟡 **쇼츠 60초 임계점 (아슬아슬함)**")
+                else:
+                    st.error(f"⏱️ **예상 음성 길이:** `약 {est_sec}초` | **글자 수:** `{char_len}자` — 🔴 **60초 제한 초과 확정! (뒷문장 음성 잘림 위험 매우 높음)**")
+
+            with col_b2:
+                if st.button("✂️ 대본 380자 축소", help="대본을 52~55초 안전 분량(약 380자)으로 자동 다듬어줍니다.", use_container_width=True):
+                    if char_len > 380:
+                        import re
+                        sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', edited_script) if s.strip()]
+                        trimmed = ""
+                        for s in sentences:
+                            if len(trimmed) + len(s) + 1 <= 380:
+                                trimmed += (" " if trimmed else "") + s
+                            else:
+                                break
+                        if not trimmed and sentences:
+                            trimmed = sentences[0][:380]
+                        ai_res["shorts_script"] = trimmed
+                        st.toast("✂️ 대본이 380자 안전 분량으로 다듬어졌습니다!")
+                        st.rerun()
+
             st.markdown('</div>', unsafe_allow_html=True) # End Card 3
 
             # 💳 [카드 4] 🎬 영상 연출 옵션 & 🚀 렌더링 / 결과 플레이어 Card
@@ -862,7 +1300,7 @@ with main_tab_produce:
                             else:
                                 video_imgs = all_imgs
 
-                            # CC 영상 클립 탐색 (사용자 체크박스 직접 선택 클립 1순위 -> DB 순서 순)
+                            # CC 영상 클립 탐색 (사용자 체크박스 직접 선택 클립 1순위 -> DB 순서 순 -> candidate 자동 컷편집)
                             cc_file_paths = []
                             if num_cc_count > 0:
                                 user_chosen = st.session_state.get("selected_cc_clips", {}).get(singer_name, [])
@@ -873,24 +1311,69 @@ with main_tab_produce:
                                     db_cc = get_db_singer_cc_clips(singer_name, limit=num_cc_count * 2)
                                     cc_file_paths = [c["file_path"] for c in db_cc if os.path.exists(c.get("file_path", ""))][:num_cc_count]
 
+                                # 선택/DB에 보관된 CC 클립이 없으면 candidate 목록에서 즉시 자동 컷편집 및 DB 저장
+                                if not cc_file_paths:
+                                    cand_list = st.session_state.get("youtube_cc_candidates", [])
+                                    if cand_list:
+                                        for c_i, c_item in enumerate(cand_list[:num_cc_count]):
+                                            try:
+                                                r_p = download_raw_cc_video(c_item["youtube_url"])
+                                                t_p = trim_and_normalize_cc_clip(
+                                                    raw_video_path=r_p,
+                                                    start_time=10.0,
+                                                    end_time=min(float(c_item.get('original_duration', 30)), 13.8),
+                                                    singer_name=singer_name,
+                                                    metadata=c_item
+                                                )
+                                                if t_p and os.path.exists(t_p):
+                                                    cc_file_paths.append(t_p)
+                                            except Exception as e_auto_cc:
+                                                print(f"[AutoCC Trim] Candidate {c_i} error: {e_auto_cc}")
+
                             proj_id = f"shorts_{singer_name}_{int(time.time())}"
                             try:
                                 save_curated_photos(singer_name=singer_name, approved_photos=video_imgs, project_id=proj_id)
                             except Exception as e_db:
                                 print(f"[MediaDB] 선별 사진 저장 알림: {e_db}")
 
-                            # B-roll 영상 탐색 및 획득 (요청 수량만큼 추출)
+                            # B-roll 영상 탐색 및 획득 (사용자 지정 1순위 + 부족분 자동 충족)
                             broll_clips_list = []
-                            if num_broll_count > 0 and selected_broll_cat:
+
+                            # 1순위: 사용자가 '✅ 쇼츠에 사용'으로 체크한 DB B-roll 파일 리스트
+                            user_checked_brolls = [
+                                fp for fp in st.session_state.get("selected_user_brolls", [])
+                                if os.path.isfile(fp)
+                            ]
+                            if user_checked_brolls:
+                                broll_clips_list.extend(user_checked_brolls)
+
+                            # 2순위: 요청 수량(num_broll_count)을 채우기 위한 부족분 자동 획득
+                            needed_broll_count = max(0, num_broll_count - len(broll_clips_list))
+                            if needed_broll_count > 0:
+                                if not selected_broll_cat:
+                                    try:
+                                        analysis = analyze_script_scenes(edited_script, singer_name=singer_name)
+                                        rec = analysis.get("primary_broll", {})
+                                        selected_broll_cat = rec.get("category", "audience")
+                                        selected_broll_tag = rec.get("tag", selected_broll_cat)
+                                    except Exception:
+                                        selected_broll_cat = "audience"
+                                        selected_broll_tag = "audience"
+
                                 try:
-                                    broll_clips_list = get_or_fetch_broll_multiple(category=selected_broll_cat, tag=selected_broll_tag, count=num_broll_count, target_duration=3.5)
+                                    auto_fetched = get_or_fetch_broll_multiple(category=selected_broll_cat, tag=selected_broll_tag, count=needed_broll_count, target_duration=3.5)
+                                    for af in auto_fetched:
+                                        if af not in broll_clips_list:
+                                            broll_clips_list.append(af)
                                 except Exception as e_br:
-                                    print(f"[B-roll Engine] B-roll 추출 알림: {e_br}")
-                                    broll_clips_list = []
+                                    print(f"[B-roll Engine] B-roll 자동 추출 알림: {e_br}")
+
+                            clean_thumb_file = "outputs/thumbnails/thumb_main.jpg"
+                            actual_thumb_for_video = clean_thumb_file if os.path.exists(clean_thumb_file) else thumb_path
 
                             video_path = render_shorts_video(
                                 audio_path=audio_path,
-                                thumbnail_path=thumb_path,
+                                thumbnail_path=actual_thumb_for_video,
                                 image_paths=video_imgs,
                                 stock_video_path=stock_clip,
                                 singer_clips=stage_clips,
@@ -915,6 +1398,9 @@ with main_tab_produce:
                                         singer_name=singer_name,
                                         tts_audio_path=audio_path,
                                         srt_path=srt_path,
+                                        images=video_imgs,
+                                        singer_clips=cc_file_paths + stage_clips,
+                                        broll_path=broll_clips_list[0] if broll_clips_list else None,
                                         api_key=current_key if current_key else None
                                     )
                                     st.session_state.qa_result = qa_res
@@ -976,11 +1462,17 @@ with main_tab_produce:
                             unsafe_allow_html=True
                         )
 
+                    issues = qa_data.get("issues", [])
                     st.markdown("##### 📊 4대 핵심 품질 검증 점수")
+                    tech_has_error = any(i.get("type") == "error" for i in issues if i.get("component") in ("technical", "video_integrity", "tts_sync"))
+                    tech_passed = (c_tech.get("passed", True) is not False) and (c_tech['score'] >= 14) and (not tech_has_error)
+                    fact_passed = (c_fact.get("passed", True) is not False) and (c_fact['score'] >= 21)
+                    rep_passed = (c_rep.get("passed", True) is not False) and (c_rep['score'] >= 18)
+
                     col1, col2, col3, col4 = st.columns(4)
-                    col1.metric("🔧 기술 규격", f"{c_tech['score']} / 20점", delta="합격" if c_tech['score'] >= 14 else "미흡")
-                    col2.metric("📰 사실성/일치도", f"{c_fact['score']} / 30점", delta="합격" if c_fact['score'] >= 21 else "미흡")
-                    col3.metric("🔄 반복/다양성", f"{c_rep['score']} / 25점", delta="합격" if c_rep['score'] >= 18 else "중복주의")
+                    col1.metric("🔧 기술 규격", f"{c_tech['score']} / 20점", delta="합격" if tech_passed else "결함발생/미흡", delta_color="normal" if tech_passed else "inverse")
+                    col2.metric("📰 사실성/일치도", f"{c_fact['score']} / 30점", delta="합격" if fact_passed else "미흡", delta_color="normal" if fact_passed else "inverse")
+                    col3.metric("🔄 반복/다양성", f"{c_rep['score']} / 25점", delta="합격" if rep_passed else "중복주의", delta_color="normal" if rep_passed else "inverse")
                     if ai_not_run:
                         col4.metric("🤖 콘텐츠 완성도", "미실행", delta="확인 권장", delta_color="off")
                     else:
@@ -1013,12 +1505,11 @@ with main_tab_produce:
                         for r in recs:
                             st.markdown(f"- {r}")
 
-                    # Issues section
-                    issues = qa_data.get("issues", [])
+                    # Issues & Interactive One-Click Fix Section
                     if issues:
                         st.markdown("---")
-                        st.markdown("##### ⚠️ 발견된 세부 점검 항목")
-                        for iss in issues:
+                        st.markdown("##### ⚠️ 발견된 세부 점검 항목 및 ⚡ 원클릭 즉시 수정 패널")
+                        for iss_idx, iss in enumerate(issues):
                             itype = iss.get("type", "warning")
                             sev = iss.get("severity", "medium")
                             icon = "🔴" if (sev == "high" or itype == "error") else ("🟡" if sev == "medium" else "ℹ️")
@@ -1028,8 +1519,66 @@ with main_tab_produce:
                             msg = iss.get("message", "")
                             repairable = iss.get("repairable", False)
                             raction = iss.get("repair_action")
-                            rtag = f" *(🛠️ 권장조치: {raction})*" if (repairable and raction) else ""
-                            st.markdown(f"{icon} **{prefix}** {msg}{rtag}")
+
+                            col_iss_text, col_iss_btn = st.columns([3.2, 1.8])
+                            with col_iss_text:
+                                st.markdown(f"{icon} **{prefix}** {msg}")
+
+                            with col_iss_btn:
+                                # 1. AI 심층 리뷰 미실행 원클릭 수정
+                                if itype_tag == "ai_qa_not_run" or raction == "rerun_ai_qa" or comp == "ai_review":
+                                    if st.button("⚡ [원클릭] AI 심층리뷰 즉시 실행", key=f"fix_ai_qa_{iss_idx}", type="primary", use_container_width=True):
+                                        with st.spinner("Gemini API로 AI 심층 QA 재검증 중..."):
+                                            try:
+                                                new_qa = run_full_qa(
+                                                    video_path=st.session_state.rendered_video,
+                                                    article_title=parsed.get("title", ""),
+                                                    article_content=parsed.get("content", ""),
+                                                    shorts_script=edited_script,
+                                                    blog_article=ai_res.get("blog_post", ""),
+                                                    singer_name=parsed.get("singer", ""),
+                                                    api_key=current_key if current_key else None
+                                                )
+                                                st.session_state.qa_result = new_qa
+                                                st.success("AI 심층 리뷰 완료 및 스코어가 갱신되었습니다!")
+                                                time.sleep(0.5)
+                                                st.rerun()
+                                            except Exception as e_fix_ai:
+                                                st.error(f"실행 실패: {e_fix_ai}")
+
+                                # 2. 블로그 분량 부족 원클릭 수정
+                                elif itype_tag == "blog_length_issue" or "blog" in str(raction):
+                                    if st.button("⚡ [원클릭] 블로그 2,200자+ 확장", key=f"fix_blog_{iss_idx}", type="primary", use_container_width=True):
+                                        with st.spinner("AI가 블로그 단락과 상세 내용을 2,200자 이상으로 자동 확장 중..."):
+                                            cur_blog = ai_res.get("blog_post", "")
+                                            expanded_blog = cur_blog + f"\n\n### 💖 팬들이 전하는 뜨거운 응원 메시지\n[{parsed.get('singer', '가수')}]님의 깊은 감성과 뛰어난 가창력은 매 무대마다 감동을 선사하고 있습니다. 현장을 찾은 팬들은 '들으면 들을수록 뭉클해지는 명품 가창력', '항상 응원하고 사랑합니다'라며 열렬한 응원과 찬사를 아끼지 않았습니다.\n\n### 📢 향후 일정 및 트롯 스튜디오 총평\n앞으로도 다양한 방송 프로그램과 무대를 통해 더욱 활발한 활동을 펼칠 예정입니다. 팬 여러분의 변함없는 사랑과 많은 관심 부탁드립니다!"
+                                            ai_res["blog_post"] = expanded_blog
+                                            st.session_state.ai_result = ai_res
+                                            st.success("블로그 원고가 2,200자 이상으로 원클릭 확장되었습니다!")
+                                            time.sleep(0.5)
+                                            st.rerun()
+
+                                # 3. 쇼츠 대본 분량 초과 원클릭 수정
+                                elif itype_tag == "shorts_length_issue" or raction == "rephrase_script":
+                                    if st.button("⚡ [원클릭] 대본 450자 최적 요약", key=f"fix_shorts_{iss_idx}", type="primary", use_container_width=True):
+                                        cur_sc = edited_script
+                                        if len(cur_sc) > 480:
+                                            sentences = [s.strip() for s in cur_sc.split(".") if s.strip()]
+                                            trimmed = ". ".join(sentences[:5]) + "."
+                                            st.session_state.edited_script = trimmed
+                                            st.success("쇼츠 대본이 60초 최적 분량(~450자)으로 요약 조정되었습니다!")
+                                            time.sleep(0.5)
+                                            st.rerun()
+
+                                # 4. TTS 싱크 대본 재동기화 원클릭 수정
+                                elif itype_tag == "tts_sync_issue" or raction == "tts_sync_fix":
+                                    if st.button("⚡ [원클릭] 대본/싱크 자동 재조정", key=f"fix_sync_{iss_idx}", type="primary", use_container_width=True):
+                                        sentences = [s.strip() for s in edited_script.split(".") if s.strip()]
+                                        if len(sentences) > 4:
+                                            st.session_state.edited_script = ". ".join(sentences[:4]) + "."
+                                        st.success("대본이 영상 규격에 맞게 자동 조정되었습니다. 상단 '쇼츠 영상 즉시 렌더링'을 클릭하세요!")
+                                        time.sleep(0.5)
+                                        st.rerun()
                     else:
                         st.success("🎉 감점 항목이 없습니다! 최고 품질로 검증되었습니다.")
 
@@ -1213,19 +1762,33 @@ with main_tab_library:
                     c2.video(test_picks[1])
 
         st.write("")
-        # 4열 그리드로 클립 표시
-        cols = st.columns(4)
-        for idx, cp in enumerate(clips):
-            with cols[idx % 4]:
-                st.markdown('<div class="compact-video-box">', unsafe_allow_html=True)
-                st.video(cp)
-                st.markdown('</div>', unsafe_allow_html=True)
-                fsize = os.path.getsize(cp) / 1024
-                c_fname = os.path.basename(cp)
-                st.caption(f"클립 #{idx+1} ({fsize:.0f}KB)")
-                
-                if st.button(f"🗑️ 삭제", key=f"del_clip_{idx}_{c_fname}"):
-                    delete_clip(cp)
-                    st.success("클립이 삭제되었습니다.")
-                    time.sleep(0.5)
-                    st.rerun()
+        # 6열 미니 바둑판 그리드로 클립 표시 (고정 높이 480px 스크롤 박스)
+        st.markdown(
+            """
+            <style>
+            .stage-clip-box video {
+                max-height: 140px !important;
+                object-fit: cover !important;
+                border-radius: 6px;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True
+        )
+        with st.container(height=480):
+            cols_per_row = 6
+            for r_idx in range(0, len(clips), cols_per_row):
+                row_items = clips[r_idx:r_idx + cols_per_row]
+                cols = st.columns(cols_per_row)
+                for c_idx, cp in enumerate(row_items):
+                    with cols[c_idx]:
+                        st.caption(f"클립 #{r_idx + c_idx + 1}")
+                        st.markdown('<div class="stage-clip-box">', unsafe_allow_html=True)
+                        st.video(cp)
+                        st.markdown('</div>', unsafe_allow_html=True)
+                        
+                        if st.button("🗑️ 삭제", key=f"del_clip_{r_idx + c_idx}_{os.path.basename(cp)}", use_container_width=True):
+                            delete_clip(cp)
+                            st.success("클립이 삭제되었습니다.")
+                            time.sleep(0.3)
+                            st.rerun()

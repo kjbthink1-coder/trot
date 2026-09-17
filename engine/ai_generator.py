@@ -20,7 +20,7 @@ ONE_SHOT_PROMPT_TEMPLATE = """당신은 수백만 조회수를 기록하는 유�
 [필수 JSON 규격]
 {
   "target_singer": "기사 문맥상의 핵심 주인공 가수 이름 (예: 조항조, 임영웅, 박서진 등 1개 단어)",
-  "shorts_script": "50~60초 분량의 나레이션 대본 (한글 공백포함 400~500자 엄수). 0~5초 오프닝 3초 후킹(정답을 미리 말하지 않고 결론 은닉형 질문으로 시작) -> 가수의 평소 인품/미담 빌드업 -> 본론 사건과 네티즌들의 감동 댓글/전문가 평가 인용 -> 훈훈한 감동 마무리. 특수기호나 효과음 지문 없이 성우가 바로 읽을 나레이션 본문만 작성할 것.",
+  "shorts_script": "50~55초 분량의 나레이션 대본 (한글 공백포함 360~400자 엄수, 절대 410자 초과 금지! 초과 시 60초 쇼츠 음성 잘림 발생). 0~5초 오프닝 3초 후킹(정답을 미리 말하지 않고 결론 은닉형 질문으로 시작) -> 가수의 평소 인품/미담 빌드업 -> 본론 사건과 네티즌들의 감동 댓글/전문가 평가 인용 -> 훈훈한 감동 마무리. 특수기호나 효과음 지문 없이 성우가 바로 읽을 나레이션 본문만 작성할 것.",
   "thumbnails": [
     {"line1": "윗줄 카피 1", "line2": "아랫줄 카피 1!!"},
     {"line1": "윗줄 카피 2", "line2": "아랫줄 카피 2..ㄷㄷ"},
@@ -43,10 +43,37 @@ ONE_SHOT_PROMPT_TEMPLATE = """당신은 수백만 조회수를 기록하는 유�
 
 CANDIDATE_GEMINI_MODELS = [
     "gemini-3.6-flash",
-    "gemini-3.8-flash",
-    "gemini-3.5-flash",
-    "gemini-flash-latest"
+    "gemini-flash-latest",
+    "gemini-3.5-flash-lite",
+    "gemini-flash-lite-latest",
+    "gemini-3.5-flash"
 ]
+
+def _get_gemini_api_keys(primary_key: str = None) -> list:
+    keys = []
+    if primary_key and primary_key.strip():
+        keys.append(primary_key.strip())
+
+    env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+    if os.path.exists(env_path):
+        try:
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if "=" in line:
+                        k, v = line.strip().split("=", 1)
+                        if k.startswith("GEMINI_API_KEY") and v.strip():
+                            val = v.strip().strip('"').strip("'")
+                            if val not in keys:
+                                keys.append(val)
+        except Exception:
+            pass
+
+    for key_name in ["GEMINI_API_KEY", "GEMINI_API_KEY_2", "GEMINI_API_KEY_3", "GEMINI_API_KEY_4"]:
+        val = os.environ.get(key_name, "")
+        if val and val.strip() and val.strip() not in keys:
+            keys.append(val.strip())
+
+    return keys
 
 def generate_contents(article_title: str, article_content: str, singer_name: str, api_key: str = None, provider: str = "gemini") -> dict:
     """
@@ -54,9 +81,9 @@ def generate_contents(article_title: str, article_content: str, singer_name: str
     1) 60초 쇼츠 대본
     2) 2줄 썸네일 카피 5종 (JSON 리스트)
     3) 2,400자 4단 블로그 원고
-    를 생성합니다.
+    를 생성합니다. (Gemini 4중 멀티 API 키 로테이션 지원)
     """
-    api_key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    gemini_keys = _get_gemini_api_keys(api_key)
 
     # .replace()를 사용하여 JSON 중괄호 충돌(KeyError) 원천 방지
     prompt = (
@@ -66,29 +93,67 @@ def generate_contents(article_title: str, article_content: str, singer_name: str
         .replace("[ARTICLE_CONTENT]", article_content[:3500])
     )
 
-    if api_key and provider == "gemini":
+    if provider == "gemini" and gemini_keys:
         try:
             from google import genai
-            client = genai.Client(api_key=api_key)
-            
-            for model_name in CANDIDATE_GEMINI_MODELS:
+            last_error_msg = ""
+            import time
+
+            for key_idx, current_key in enumerate(gemini_keys):
                 try:
-                    res = client.models.generate_content(
-                        model=model_name,
-                        contents=prompt,
-                        config={"response_mime_type": "application/json"}
-                    )
-                    data = json.loads(res.text)
-                    return {
-                        "target_singer": data.get("target_singer", singer_name),
-                        "shorts_script": data.get("shorts_script", ""),
-                        "thumbnails": data.get("thumbnails", _fallback_thumbnails(singer_name, article_title)),
-                        "blog_post": data.get("blog_post", ""),
-                        "engine_used": f"Gemini ({model_name})"
-                    }
-                except Exception as me:
-                    print(f"Model {model_name} failed: {me}")
+                    client = genai.Client(api_key=current_key)
+                except Exception as e_client:
                     continue
+
+                key_failed_429 = False
+                for model_name in CANDIDATE_GEMINI_MODELS:
+                    if key_failed_429:
+                        break
+
+                    for attempt in range(2):
+                        try:
+                            res = client.models.generate_content(
+                                model=model_name,
+                                contents=prompt,
+                                config={"response_mime_type": "application/json"}
+                            )
+                            raw_text = res.text.strip() if res and res.text else ""
+                            if raw_text.startswith("```"):
+                                import re
+                                raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text, flags=re.IGNORECASE)
+                                raw_text = re.sub(r"\s*```$", "", raw_text)
+
+                            data = json.loads(raw_text)
+                            if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
+                                data = data[0]
+
+                            if not isinstance(data, dict):
+                                raise ValueError(f"Gemini response structure is not a dict: {type(data)}")
+
+                            key_label = f"Key #{key_idx + 1}" if len(gemini_keys) > 1 else "Primary Key"
+                            return {
+                                "target_singer": data.get("target_singer", singer_name),
+                                "shorts_script": data.get("shorts_script", ""),
+                                "thumbnails": data.get("thumbnails", _fallback_thumbnails(singer_name, article_title)),
+                                "blog_post": data.get("blog_post", ""),
+                                "engine_used": f"Gemini ({model_name} | {key_label})"
+                            }
+                        except Exception as me:
+                            last_error_msg = str(me)
+                            if "429" in last_error_msg or "RESOURCE_EXHAUSTED" in last_error_msg:
+                                print(f"Key #{key_idx + 1} quota exhausted (429). Moving to Key #{key_idx + 2} immediately!")
+                                key_failed_429 = True
+                                break
+                            elif "503" in last_error_msg or "UNAVAILABLE" in last_error_msg or "NOT_FOUND" in last_error_msg:
+                                print(f"Model [{model_name}] busy/unavailable ({last_error_msg[:40]}). Switching to next model instantly...")
+                                break
+                            else:
+                                break
+
+            # 모든 모델 시도 실패 시
+            fallback = _generate_fallback(article_title, article_content, singer_name)
+            fallback["engine_used"] = f"대체 생성기 (Gemini 응답 실패: {last_error_msg[:60]})"
+            return fallback
 
         except Exception as e:
             print(f"Gemini API 호출 실패: {e}")
@@ -108,6 +173,8 @@ def generate_contents(article_title: str, article_content: str, singer_name: str
                 response_format={"type": "json_object"}
             )
             data = json.loads(res.choices[0].message.content)
+            if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
+                data = data[0]
             return {
                 "target_singer": data.get("target_singer", singer_name),
                 "shorts_script": data.get("shorts_script", ""),

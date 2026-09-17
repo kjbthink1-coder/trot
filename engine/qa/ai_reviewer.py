@@ -26,9 +26,11 @@ if not logger.handlers:
 
 # Candidate models ordered by priority
 CANDIDATE_GEMINI_MODELS = [
-    "gemini-1.5-flash",
-    "gemini-1.5-pro",
-    "gemini-2.0-flash"
+    "gemini-3.6-flash",
+    "gemini-flash-latest",
+    "gemini-3.5-flash-lite",
+    "gemini-flash-lite-latest",
+    "gemini-3.5-flash"
 ]
 
 STRICT_SYSTEM_PROMPT_PREFIX = """당신은 엄격한 유튜브 쇼츠 및 블로그 품질 검수관입니다.
@@ -62,19 +64,11 @@ FALLBACK_RESULT: Dict[str, Any] = {
 }
 
 
-def get_gemini_api_key(api_key: Optional[str] = None) -> Optional[str]:
-    """
-    Retrieves the Gemini API key from the function argument, environment variables,
-    or by traversing upwards to find a .env file.
-    """
+def resolve_all_gemini_keys(api_key: Optional[str] = None) -> List[str]:
+    keys: List[str] = []
     if api_key and api_key.strip():
-        return api_key.strip()
+        keys.append(api_key.strip())
 
-    env_val = os.environ.get("GEMINI_API_KEY")
-    if env_val and env_val.strip():
-        return env_val.strip()
-
-    # Search for .env in current and parent directories
     search_dir = os.path.dirname(os.path.abspath(__file__))
     for _ in range(5):
         candidate = os.path.join(search_dir, ".env")
@@ -83,10 +77,10 @@ def get_gemini_api_key(api_key: Optional[str] = None) -> Optional[str]:
                 with open(candidate, "r", encoding="utf-8") as f:
                     for line in f:
                         line = line.strip()
-                        if line.startswith("GEMINI_API_KEY="):
-                            key = line.split("=", 1)[1].strip().strip('"').strip("'")
-                            if key:
-                                return key
+                        if line.startswith("GEMINI_API_KEY"):
+                            k = line.split("=", 1)[1].strip().strip('"').strip("'")
+                            if k and k not in keys:
+                                keys.append(k)
             except Exception:
                 pass
         parent = os.path.dirname(search_dir)
@@ -94,7 +88,18 @@ def get_gemini_api_key(api_key: Optional[str] = None) -> Optional[str]:
             break
         search_dir = parent
 
-    return None
+    for env_k in ["GEMINI_API_KEY", "GEMINI_API_KEY_2", "GEMINI_API_KEY_3", "GEMINI_API_KEY_4"]:
+        v = os.environ.get(env_k)
+        if v and v.strip() and v.strip() not in keys:
+            keys.append(v.strip())
+
+    return keys
+
+def resolve_gemini_key(api_key: Optional[str] = None) -> Optional[str]:
+    all_keys = resolve_all_gemini_keys(api_key)
+    return all_keys[0] if all_keys else None
+
+get_gemini_api_key = resolve_gemini_key
 
 
 def build_qa_prompt(
@@ -313,17 +318,22 @@ def parse_json_from_response(raw_text: str) -> Optional[dict]:
         cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
         cleaned = re.sub(r"\s*```$", "", cleaned)
 
+    data = None
     try:
-        return json.loads(cleaned)
+        data = json.loads(cleaned)
     except Exception:
         # Attempt regex extraction of the first JSON object
         match = re.search(r"(\{.*\})", cleaned, re.DOTALL)
         if match:
             try:
-                return json.loads(match.group(1))
+                data = json.loads(match.group(1))
             except Exception:
                 pass
-    return None
+
+    if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
+        data = data[0]
+
+    return data if isinstance(data, dict) else None
 
 
 def review_with_ai(
@@ -390,32 +400,46 @@ def review_with_ai(
     contents_text_only: List[Any] = [prompt_text]
 
     # Attempt Google GenAI SDK (google.genai)
+    all_gemini_keys = resolve_all_gemini_keys(api_key)
     try:
         from google import genai
-        client = genai.Client(api_key=resolved_key)
 
-        for model_name in CANDIDATE_GEMINI_MODELS:
-            # 1. Try with multimodal images + prompt
-            for contents_to_try in ([contents_multimodal] if has_frames else []) + [contents_text_only]:
-                try:
-                    logger.info(f"Calling Gemini ({model_name}) with {len(contents_to_try)} parts...")
-                    res = client.models.generate_content(
-                        model=model_name,
-                        contents=contents_to_try,
-                        config={"response_mime_type": "application/json"}
-                    )
-                    if res and res.text:
-                        parsed = parse_json_from_response(res.text)
-                        if parsed:
-                            sanitized = sanitize_review_response(parsed)
-                            logger.info(
-                                f"Gemini review succeeded with {model_name}: "
-                                f"score={sanitized['score']}, status={sanitized['status']}, issues={len(sanitized['issues'])}"
-                            )
-                            return sanitized
-                except Exception as model_err:
-                    logger.debug(f"Model {model_name} attempt failed with error: {model_err}")
-                    continue
+        for key_idx, current_key in enumerate(all_gemini_keys):
+            try:
+                client = genai.Client(api_key=current_key)
+            except Exception as e_client:
+                continue
+
+            key_failed_429 = False
+            for model_name in CANDIDATE_GEMINI_MODELS:
+                if key_failed_429:
+                    break
+
+                for contents_to_try in ([contents_multimodal] if has_frames else []) + [contents_text_only]:
+                    try:
+                        logger.info(f"Calling Gemini ({model_name} | Key #{key_idx + 1}) with {len(contents_to_try)} parts...")
+                        res = client.models.generate_content(
+                            model=model_name,
+                            contents=contents_to_try,
+                            config={"response_mime_type": "application/json"}
+                        )
+                        if res and res.text:
+                            parsed = parse_json_from_response(res.text)
+                            if parsed:
+                                sanitized = sanitize_review_response(parsed)
+                                logger.info(
+                                    f"Gemini review succeeded with {model_name} (Key #{key_idx + 1}): "
+                                    f"score={sanitized['score']}, status={sanitized['status']}, issues={len(sanitized['issues'])}"
+                                )
+                                return sanitized
+                    except Exception as model_err:
+                        err_str = str(model_err)
+                        if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                            logger.warning(f"Key #{key_idx + 1} quota exhausted (429) during AI review. Moving to Key #{key_idx + 2}...")
+                            key_failed_429 = True
+                            break
+                        logger.debug(f"Model {model_name} attempt failed with error: {model_err}")
+                        continue
 
     except ImportError:
         logger.debug("google.genai SDK not available; attempting google.generativeai fallback.")

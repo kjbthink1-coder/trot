@@ -424,7 +424,17 @@ def validate_technical_quality(
             tts_dur = tts_info.get("duration")
             if tts_dur is not None and video_dur > 0:
                 diff_sec = abs(video_dur - tts_dur)
-                if diff_sec <= 2.5:
+                if tts_dur > 60.2 and video_dur <= 60.1:
+                    critical_error = True
+                    issues.append({
+                        "type": "error",
+                        "component": "tts_sync",
+                        "issue_type": "truncated_speech",
+                        "message": f"대본 오디오 원본({tts_dur:.1f}초)이 60초 유튜브 제한으로 인해 싹둑 잘렸습니다. 자동 배속(Atempo) 또는 대본 축소가 필요합니다.",
+                        "repairable": True,
+                        "repair_action": "tts_sync_fix"
+                    })
+                elif diff_sec <= 2.5:
                     tts_sync_score = 2.0
                 elif diff_sec <= 5.0:
                     tts_sync_score = 1.0
@@ -435,10 +445,13 @@ def validate_technical_quality(
                     })
                 else:
                     tts_sync_score = 0.0
+                    critical_error = True
                     issues.append({
                         "type": "error",
                         "component": "tts_sync",
-                        "message": f"Severe desynchronization between TTS ({tts_dur:.2f}s) and video ({video_dur:.2f}s): {diff_sec:.2f}s difference (> 5.0s)."
+                        "message": f"Severe desynchronization between TTS ({tts_dur:.2f}s) and video ({video_dur:.2f}s): {diff_sec:.2f}s difference (> 5.0s).",
+                        "repairable": True,
+                        "repair_action": "tts_sync_fix"
                     })
             else:
                 tts_sync_score = 1.0
@@ -515,6 +528,8 @@ def validate_technical_quality(
         video_integrity_score + resolution_score + fps_score + audio_score + assets_score,
         1
     )
+    if critical_error:
+        total_score = min(total_score, 12.0)
     total_score = max(0.0, min(20.0, total_score))
 
     # Passed threshold: >= 14.0 pts (70%) and no critical error

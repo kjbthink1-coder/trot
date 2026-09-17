@@ -160,6 +160,7 @@ def run_full_qa(
     srt_path: Optional[str] = None,
     images: Optional[List[str]] = None,
     broll_path: Optional[str] = None,
+    singer_clips: Optional[List[str]] = None,
     timeline_segments: Optional[List[Dict[str, Any]]] = None,
     api_key: Optional[str] = None,
     project_id: Optional[str] = None,
@@ -247,7 +248,7 @@ def run_full_qa(
         # 3. QA-3 Repetition Validator (Max 25.0 pts)
         # -------------------------------------------------------------
         try:
-            brolls = [broll_path] if broll_path else []
+            brolls = ([broll_path] if broll_path else []) + (singer_clips or [])
             rep_res = validate_repetition(
                 singer_name=singer_name or "",
                 current_images=images or [],
@@ -298,13 +299,13 @@ def run_full_qa(
                     "start_time": None,
                     "end_time": None,
                     "evidence": f"AI 심층 리뷰 미실행 ({e_ai})",
-                    "repairable": False,
-                    "repair_action": None,
+                    "repairable": True,
+                    "repair_action": "rerun_ai_qa",
                     "component": "ai_review",
                     "type": "warning",
                     "message": "AI 심층 리뷰 미실행 (API 확인 필요 - 수동 확인 권장)"
                 }],
-                "recommendations": ["AI 심층 리뷰 미실행 (API 확인 필요 - 수동 확인 권장)"]
+                "recommendations": ["AI 심층 리뷰 미실행 (API 확인 필요 - 아래 원클릭 수정 버튼으로 즉시 실행)"]
             }
         finally:
             if extracted_frames:

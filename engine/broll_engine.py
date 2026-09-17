@@ -218,13 +218,15 @@ def normalize_category_name(category: str) -> str:
 def normalize_video_clip(
     input_path: str,
     output_path: str,
-    target_duration: float = 3.5
+    target_duration: float = 3.5,
+    start_time: float = 0.0
 ) -> bool:
     """
     Normalizes a video clip using FFmpeg:
       - 1080x1920 (9:16 vertical shorts format)
       - Exact 30 fps (-r 30)
       - Audio completely muted (-an)
+      - Start time offset (-ss)
       - Duration limited to target_duration (-t)
       - High compatibility H.264 & YUV420p
     """
@@ -241,7 +243,7 @@ def normalize_video_clip(
 
     cmd = [
         ffmpeg_exe, "-y",
-        "-ss", "0",
+        "-ss", str(max(0.0, float(start_time))),
         "-i", os.path.abspath(input_path),
         "-t", str(max(1.0, float(target_duration))),
         "-vf", vf_chain,
@@ -469,7 +471,16 @@ def get_or_fetch_broll(
 
     # -------------------------------------------------------------
     # Step 1: Check Local DB first (0 network calls, offline-first)
+    # 1st Priority: Approved user B-roll clips (approved=1)
     # -------------------------------------------------------------
+    approved_clips = media_db.get_broll_clips_by_category(category=norm_cat, approved_only=True, limit=5, db_path=db_path)
+    for row in approved_clips:
+        fpath = row.get("file_path")
+        if fpath and os.path.isfile(fpath):
+            logger.info(f"[B-roll Engine] Reusing approved clip from DB for '{category}': {fpath}")
+            return fpath
+
+    # Secondary check: general local B-roll query by tags
     query_tags = [norm_cat]
     if norm_tag:
         query_tags.append(norm_tag)
@@ -567,6 +578,7 @@ def get_or_fetch_broll(
                     author=candidate.get("author"),
                     license=candidate.get("license"),
                     tags=[norm_cat] + ([norm_tag] if norm_tag else []),
+                    approved=0,
                     db_path=db_path
                 )
                 return final_clip_path
@@ -587,7 +599,7 @@ def get_or_fetch_broll(
                         pass
 
                 if norm_ok:
-                    # Step 6: Register in media_db
+                    # Step 6: Register in media_db (approved=0 to avoid garbage DB collection)
                     tags_to_store = [norm_cat]
                     if norm_tag and norm_tag != norm_cat:
                         tags_to_store.append(norm_tag)
@@ -603,9 +615,10 @@ def get_or_fetch_broll(
                         license=candidate.get("license"),
                         tags=tags_to_store,
                         description=f"B-roll footage: {category} ({tag or ''})",
+                        approved=0,
                         db_path=db_path
                     )
-                    logger.info(f"[B-roll Engine] Successfully ingested and registered: {final_clip_path}")
+                    logger.info(f"[B-roll Engine] Successfully ingested and registered unapproved temp clip: {final_clip_path}")
                     return final_clip_path
 
         except Exception as e:
@@ -623,68 +636,146 @@ def get_or_fetch_broll(
     return None
 
 
+def trim_and_normalize_user_broll(
+    input_path: str,
+    output_dir: Optional[str] = None,
+    start_sec: float = 0.0,
+    duration_sec: float = 4.0,
+    category: str = "general"
+) -> str:
+    """
+    Trims a user-specified video section (start_sec ~ start_sec + duration_sec, 3~4s)
+    and normalizes to 1080x1920 9:16 vertical (30fps, muted -an) using FFmpeg.
+    
+    Args:
+        input_path: Path to input video file.
+        output_dir: Target directory (defaults to assets/general_broll/{norm_cat}).
+        start_sec: Start offset in seconds (default 0.0).
+        duration_sec: Clip duration in seconds (default 4.0s).
+        category: B-roll category string.
+        
+    Returns:
+        str: Absolute path of normalized output MP4 video file.
+    """
+    norm_input = os.path.abspath(input_path)
+    if not os.path.isfile(norm_input):
+        raise FileNotFoundError(f"Input video file not found: {norm_input}")
+        
+    norm_cat = normalize_category_name(category)
+    target_dir = os.path.abspath(output_dir or os.path.join(DEFAULT_BROLL_DIR, norm_cat))
+    os.makedirs(target_dir, exist_ok=True)
+    
+    dur = max(1.0, float(duration_sec))
+    url_hash = hashlib.sha256(f"user_trim_{norm_input}_{start_sec}_{dur}_{time.time()}".encode("utf-8")).hexdigest()[:8]
+    output_filename = f"broll_{norm_cat}_trimmed_{url_hash}.mp4"
+    output_path = os.path.join(target_dir, output_filename)
+    
+    cut_ok = cut_broll_clip(
+        input_path=norm_input,
+        output_path=output_path,
+        start_time=start_sec,
+        end_time=start_sec + dur,
+        target_duration=dur,
+        target_width=1080,
+        target_height=1920,
+        fps=30
+    )
+    
+    if not cut_ok or not os.path.isfile(output_path):
+        raise RuntimeError(f"FFmpeg trim and normalization failed for '{input_path}' -> '{output_path}'")
+        
+    return output_path
+
+
 def get_or_fetch_broll_multiple(
-    category: str,
+    category_or_categories: Union[List[str], str, None] = None,
     tag: Optional[str] = None,
     count: int = 1,
+    count_per_category: int = 1,
     target_duration: float = 3.5,
+    preferred_ids: Optional[List[int]] = None,
     db_path: Optional[str] = None,
-    allow_stock_fallback: bool = True
+    allow_stock_fallback: bool = True,
+    category: Optional[str] = None,
+    categories: Optional[Union[List[str], str]] = None,
 ) -> List[str]:
     """
-    Retrieves up to `count` non-duplicate B-roll video clip paths for the given category/tag.
-    Combines DB queries, API search, and fallback stock clips to return exact requested count.
-    """
-    if count <= 0:
-        return []
+    Retrieves B-roll video clip paths with 1st priority matching for user-reviewed/approved DB B-rolls (approved=1).
     
+    Supports flexible signatures:
+      - get_or_fetch_broll_multiple(categories=['audience', 'concert'], count_per_category=1, preferred_ids=[1, 2])
+      - get_or_fetch_broll_multiple(category='audience', tag='fans', count=2)
+    """
     ensure_broll_directories()
-    norm_cat = normalize_category_name(category)
-    norm_tag = tag.strip().lower() if tag else None
 
-    query_tags = [norm_cat]
-    if norm_tag:
-        query_tags.append(norm_tag)
+    cat_input = categories if categories is not None else (category_or_categories if category_or_categories is not None else category)
+    if cat_input is None:
+        cat_input = ["audience"]
 
-    results = []
-    seen = set()
+    is_list_input = isinstance(cat_input, list)
+    cat_list = cat_input if isinstance(cat_input, list) else [str(cat_input)]
+    req_count = count_per_category if is_list_input and count_per_category > 1 else count
 
-    # Step 1: Fetch all matching local clips from DB
-    local_clips = media_db.query_brolls(tags=query_tags, limit=count * 3, db_path=db_path)
-    for row in local_clips:
-        fpath = row.get("file_path")
-        if fpath and os.path.isfile(fpath) and fpath not in seen:
-            results.append(fpath)
-            seen.add(fpath)
-            if len(results) >= count:
-                return results[:count]
+    all_results: List[str] = []
+    seen: set = set()
 
-    # Check category alone if tag was provided
-    if norm_tag and len(results) < count:
-        cat_clips = media_db.query_brolls(tags=[norm_cat], limit=count * 3, db_path=db_path)
-        for row in cat_clips:
-            fpath = row.get("file_path")
-            if fpath and os.path.isfile(fpath) and fpath not in seen:
-                results.append(fpath)
-                seen.add(fpath)
-                if len(results) >= count:
-                    return results[:count]
+    # Priority 0: Handle preferred_ids if specified
+    if preferred_ids:
+        try:
+            with media_db.get_db_connection(db_path) as conn:
+                cur = conn.cursor()
+                placeholders = ",".join("?" for _ in preferred_ids)
+                cur.execute(f"SELECT file_path FROM media WHERE id IN ({placeholders}) AND active = 1", tuple(preferred_ids))
+                for row in cur.fetchall():
+                    fp = row["file_path"]
+                    if fp and os.path.isfile(fp) and fp not in seen:
+                        all_results.append(fp)
+                        seen.add(fp)
+        except Exception as e:
+            logger.debug(f"Error checking preferred_ids: {e}")
 
-    # Step 2: Try fetching via single clip retriever
-    if len(results) < count:
-        single = get_or_fetch_broll(category=category, tag=tag, target_duration=target_duration, db_path=db_path, allow_stock_fallback=False)
-        if single and os.path.isfile(single) and single not in seen:
-            results.append(single)
-            seen.add(single)
+    for c in cat_list:
+        norm_cat = normalize_category_name(c)
+        cat_results: List[str] = []
 
-    # Step 3: Fallback stock clip if needed to reach count
-    if len(results) < count and allow_stock_fallback:
-        stock = get_fallback_stock_video()
-        if stock and os.path.isfile(stock) and stock not in seen:
-            results.append(stock)
-            seen.add(stock)
+        # Priority 1 (1순위): User-reviewed / approved DB B-rolls (approved=1)
+        approved_rows = media_db.get_broll_clips_by_category(category=norm_cat, approved_only=True, limit=req_count * 2, db_path=db_path)
+        for r in approved_rows:
+            fp = r.get("file_path")
+            if fp and os.path.isfile(fp) and fp not in seen:
+                cat_results.append(fp)
+                seen.add(fp)
+                if len(cat_results) >= req_count:
+                    break
 
-    return results[:count]
+        # Priority 2: General local DB B-roll clips if approved clips alone did not reach req_count
+        if len(cat_results) < req_count:
+            gen_rows = media_db.query_brolls(tags=[norm_cat], limit=req_count * 3, db_path=db_path)
+            for r in gen_rows:
+                fp = r.get("file_path")
+                if fp and os.path.isfile(fp) and fp not in seen:
+                    cat_results.append(fp)
+                    seen.add(fp)
+                    if len(cat_results) >= req_count:
+                        break
+
+        # Priority 3: External API or single fetcher if count still not reached
+        if len(cat_results) < req_count:
+            fetched = get_or_fetch_broll(category=norm_cat, tag=tag, target_duration=target_duration, db_path=db_path, allow_stock_fallback=allow_stock_fallback)
+            if fetched and os.path.isfile(fetched) and fetched not in seen:
+                cat_results.append(fetched)
+                seen.add(fetched)
+
+        # Priority 4: Fallback stock clip if needed to reach count
+        if len(cat_results) < req_count and allow_stock_fallback:
+            stock = get_fallback_stock_video()
+            if stock and os.path.isfile(stock) and stock not in seen:
+                cat_results.append(stock)
+                seen.add(stock)
+
+        all_results.extend(cat_results[:req_count])
+
+    return all_results
 
 
 def sync_broll_assets(db_path: Optional[str] = None) -> Dict[str, int]:
@@ -720,3 +811,118 @@ def sync_broll_assets(db_path: Optional[str] = None) -> Dict[str, int]:
 
     logger.info(f"[B-roll Engine] Synced existing general_broll assets. New: {indexed_count}")
     return {"new_brolls": indexed_count}
+
+
+def cut_broll_clip(
+    input_path: str,
+    output_path: str,
+    start_time: Optional[float] = None,
+    end_time: Optional[float] = None,
+    target_duration: float = 3.5,
+    target_width: int = 1080,
+    target_height: int = 1920,
+    fps: int = 30
+) -> bool:
+    """
+    Cuts (trims start_time -> end_time or target_duration) and normalizes video clip to 9:16 portrait 30fps muted.
+    """
+    ffmpeg_exe = get_ffmpeg_exe()
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+
+    ss_args = []
+    if start_time is not None and start_time >= 0:
+        ss_args = ["-ss", str(start_time)]
+
+    dur = target_duration
+    if start_time is not None and end_time is not None and end_time > start_time:
+        dur = end_time - start_time
+
+    vf_filter = (
+        f"scale={target_width}:{target_height}:force_original_aspect_ratio=increase,"
+        f"crop={target_width}:{target_height},"
+        f"fps={fps},format=yuv420p"
+    )
+
+    cmd = [
+        ffmpeg_exe, "-y"
+    ] + ss_args + [
+        "-i", os.path.abspath(input_path),
+        "-t", str(dur),
+        "-vf", vf_filter,
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "22",
+        "-an",
+        os.path.abspath(output_path)
+    ]
+
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace")
+        if res.returncode == 0 and os.path.isfile(output_path) and os.path.getsize(output_path) > 1000:
+            return True
+        else:
+            logger.error(f"cut_broll_clip FFmpeg error: {res.stderr}")
+            return False
+    except Exception as e:
+        logger.error(f"cut_broll_clip failed: {e}")
+        return False
+
+
+def save_approved_broll(
+    file_path: str,
+    category: str,
+    tags: Optional[Union[List[str], str]] = None,
+    description: Optional[str] = None,
+    start_sec: float = 0.0,
+    duration_sec: float = 4.0,
+    start_time: Optional[float] = None,
+    end_time: Optional[float] = None,
+    target_duration: float = 3.5,
+    db_path: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Normalizes (if needed) and registers a user-approved B-roll clip into Media DB with approved=1, subtype='general_broll', active=1.
+    Serves as the primary approved entrypoint for curated B-roll collection.
+    """
+    norm_input = os.path.abspath(file_path)
+    if not os.path.isfile(norm_input):
+        raise FileNotFoundError(f"Input B-roll clip not found: {norm_input}")
+
+    norm_cat = normalize_category_name(category)
+    
+    actual_start = start_sec if start_sec != 0.0 else (start_time if start_time is not None else 0.0)
+    if start_time is not None and end_time is not None and end_time > start_time:
+        actual_dur = end_time - start_time
+    else:
+        actual_dur = duration_sec if duration_sec != 4.0 else target_duration
+
+    normalized_path = trim_and_normalize_user_broll(
+        input_path=norm_input,
+        output_dir=os.path.join(DEFAULT_BROLL_DIR, norm_cat),
+        start_sec=actual_start,
+        duration_sec=actual_dur,
+        category=norm_cat
+    )
+
+    tag_list = [norm_cat, "curated", "broll", "approved"]
+    if tags:
+        if isinstance(tags, (list, set, tuple)):
+            tag_list.extend([str(t).strip().lower() for t in tags if str(t).strip()])
+        elif isinstance(tags, str):
+            tag_list.extend([t.strip().lower() for t in tags.replace(";", ",").split(",") if t.strip()])
+    tag_list = list(dict.fromkeys(tag_list))
+
+    reg_result = media_db.register_approved_broll(
+        file_path=normalized_path,
+        category=norm_cat,
+        tags=tag_list,
+        description=description or f"User approved B-roll for category '{norm_cat}'",
+        source="user_approved",
+        db_path=db_path
+    )
+    return reg_result
+
+
+# Backwards compatibility alias
+save_curated_broll = save_approved_broll
+

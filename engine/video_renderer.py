@@ -163,6 +163,54 @@ def hex_to_ass_color(hex_str: str) -> str:
         return f"&H00{b}{g}{r}".upper()
     return "&H0000FFFF"
 
+def scale_srt_file(srt_path: str, speed_factor: float, out_srt_path: str):
+    """
+    SRT 자막 파일의 타임스탬프를 speed_factor로 나누어
+    오디오 배속(atempo) 적용 시에도 자막과 음성 싱크가 100% 일치하도록 재계산합니다.
+    """
+    import shutil
+    if not srt_path or not os.path.exists(srt_path) or speed_factor <= 0.0 or abs(speed_factor - 1.0) < 0.001:
+        if srt_path and os.path.exists(srt_path):
+            shutil.copy(os.path.abspath(srt_path), out_srt_path)
+        return
+
+    def parse_time_str(ts_str: str) -> float:
+        ts_str = ts_str.strip().replace(',', '.')
+        parts = ts_str.split(':')
+        h = float(parts[0])
+        m = float(parts[1])
+        s = float(parts[2])
+        return h * 3600.0 + m * 60.0 + s
+
+    def format_time_str(seconds: float) -> str:
+        ms = int(round((seconds - int(seconds)) * 1000))
+        if ms >= 1000:
+            seconds += 1.0
+            ms = 0
+        total_s = int(seconds)
+        h = total_s // 3600
+        m = (total_s % 3600) // 60
+        s = total_s % 60
+        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+    lines = []
+    try:
+        with open(srt_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if "-->" in line:
+                    start_str, end_str = line.split("-->")
+                    start_s = parse_time_str(start_str) / speed_factor
+                    end_s = parse_time_str(end_str) / speed_factor
+                    lines.append(f"{format_time_str(start_s)} --> {format_time_str(end_s)}\n")
+                else:
+                    lines.append(line)
+
+        with open(out_srt_path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+    except Exception as e:
+        print(f"[Video Renderer Warning] SRT scaling error ({e}); using original SRT.")
+        shutil.copy(os.path.abspath(srt_path), out_srt_path)
+
 def render_shorts_video(
     audio_path: str,
     thumbnail_path: str,
@@ -192,19 +240,21 @@ def render_shorts_video(
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
     
-    # 60초 마스터 클락 제어: Edge-TTS 오디오 길이 기준으로 엄격히 바운딩
+    temp_dir = os.path.abspath("outputs/temp_render")
+    os.makedirs(temp_dir, exist_ok=True)
+
+    # 60초 마스터 클락 제어: 자연스러운 1.0x 오디오 음성 유지 (어색한 배속 변형 원천 제거)
     raw_duration = get_media_duration(audio_path)
+    audio_to_use = audio_path
+    speed_factor = 1.0
     if raw_duration > 60.0:
-        print(f"[Video Renderer] 경고: 오디오 길이({raw_duration:.2f}초)가 유튜브 쇼츠 제한(60초)을 초과하여 60.0초로 제한(clamp)합니다.")
+        print(f"[Video Renderer] 경고: 오디오 원본 길이({raw_duration:.1f}초)가 유튜브 쇼츠 제한(60초)을 초과함. 대본 축소 권장.")
         total_duration = 60.0
     elif raw_duration <= 0.0:
         total_duration = 50.0
     else:
         total_duration = round(raw_duration, 2)
     print(f"[Video Renderer] 최종 기준 재생시간(Master Clock): {total_duration:.2f}초 (원본: {raw_duration:.2f}초)")
-
-    temp_dir = os.path.abspath("outputs/temp_render")
-    os.makedirs(temp_dir, exist_ok=True)
 
     # [핵심] 모든 이미지와 썸네일을 표준 baseline RGB JPEG로 정규화
     from PIL import Image
@@ -248,18 +298,21 @@ def render_shorts_video(
     thumb_dur = 2.0
     clip_dur = 3.5
 
-    # 영상 클립 풀 구성 (가수 무대 짤 + 가수 CC 영상 클립 + B-roll 리스트 + 스톡 영상)
+    # 영상 클립 풀 구성 (가수 CC 영상과 B-roll을 1:1 교차로 번갈아 배치하여 영상 전반부부터 B-roll 등장)
     active_video_clips = []
-    for sc in valid_singer_clips:
-        active_video_clips.append(("stage_clip", sc))
-    for cc in valid_cc_clips:
-        active_video_clips.append(("singer_cc_video", cc))
-    for br in all_broll_paths:
-        active_video_clips.append(("broll", br))
+    max_len = max(len(valid_singer_clips), len(valid_cc_clips), len(all_broll_paths), 1 if (stock_video_path and os.path.exists(stock_video_path)) else 0)
+    for idx in range(max_len):
+        if idx < len(valid_cc_clips):
+            active_video_clips.append(("singer_cc_video", valid_cc_clips[idx]))
+        if idx < len(all_broll_paths):
+            active_video_clips.append(("broll", all_broll_paths[idx]))
+        if idx < len(valid_singer_clips):
+            active_video_clips.append(("stage_clip", valid_singer_clips[idx]))
+
     if stock_video_path and os.path.exists(stock_video_path):
         active_video_clips.append(("stock", os.path.abspath(stock_video_path)))
 
-    print(f"[Video Renderer] 커스텀 영상 클립 조합 구성 완료 (총 {len(active_video_clips)}개 클립: Stage={len(valid_singer_clips)}, CC={len(valid_cc_clips)}, Broll={len(all_broll_paths)})")
+    print(f"[Video Renderer] 커스텀 영상 클립 조합 교차 구성 완료 (총 {len(active_video_clips)}개 클립: Stage={len(valid_singer_clips)}, CC={len(valid_cc_clips)}, Broll={len(all_broll_paths)})")
 
     total_video_dur = len(active_video_clips) * clip_dur
     min_img_total = len(valid_images) * 2.0
@@ -472,8 +525,7 @@ def render_shorts_video(
     vf_sub = []
     if srt_path and os.path.exists(srt_path) and os.path.getsize(srt_path) > 10:
         local_srt = os.path.join(temp_dir, "shorts_sub.srt")
-        import shutil
-        shutil.copy(os.path.abspath(srt_path), local_srt)
+        scale_srt_file(srt_path, speed_factor, local_srt)
         ass_color = hex_to_ass_color(sub_color)
         # 5070 시니어 맞춤 고대비 볼드 자막 스타일 (커스텀 크기/색상 + 블랙 두꺼운 테두리 + 하단 안전지대 MarginV={sub_margin_v} + WrapStyle=2로 복수 줄바꿈 원천 차단)
         style = f"Fontname=Malgun Gothic,Fontsize={sub_font_size},Bold=1,PrimaryColour={ass_color},OutlineColour=&H00000000,BorderStyle=1,Outline=2.4,Shadow=1,Alignment=2,MarginV={sub_margin_v},WrapStyle=2"
@@ -482,7 +534,7 @@ def render_shorts_video(
     cmd_final = [
         ffmpeg_exe, "-y",
         "-i", "combined_no_audio.mp4",
-        "-i", os.path.abspath(audio_path),
+        "-i", os.path.abspath(audio_to_use),
         "-map", "0:v:0",
         "-map", "1:a:0",
     ] + vf_sub + [

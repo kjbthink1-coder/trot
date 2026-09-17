@@ -111,6 +111,7 @@ def init_db(db_path: Optional[str] = None) -> str:
                 use_count INTEGER DEFAULT 0,
                 favorite INTEGER DEFAULT 0,
                 active INTEGER DEFAULT 1,
+                approved INTEGER DEFAULT 0,
                 FOREIGN KEY(singer_id) REFERENCES singers(id) ON DELETE SET NULL
             );
         """)
@@ -137,7 +138,8 @@ def init_db(db_path: Optional[str] = None) -> str:
             "width": "INTEGER",
             "height": "INTEGER",
             "fps": "REAL",
-            "rights_status": "TEXT DEFAULT 'verified'"
+            "rights_status": "TEXT DEFAULT 'verified'",
+            "approved": "INTEGER DEFAULT 0"
         }
         for col_name, col_type in cc_cols.items():
             if col_name not in media_columns:
@@ -222,6 +224,8 @@ def init_db(db_path: Optional[str] = None) -> str:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_media_singer_id ON media(singer_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_media_type_subtype ON media(media_type, subtype);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_media_active ON media(active);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_media_approved ON media(approved);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_media_broll_opt ON media(active, approved, subtype, media_type);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_media_use_favorite ON media(favorite, use_count, last_used_at);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_media_tags_tag ON media_tags(tag);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_api_cache_lookup ON api_cache(provider, query, media_type);")
@@ -479,6 +483,7 @@ def register_media(
     license: Optional[str] = None,
     favorite: int = 0,
     active: int = 1,
+    approved: int = 0,
     db_path: Optional[str] = None
 ) -> Dict[str, Any]:
     """
@@ -488,6 +493,7 @@ def register_media(
       - Marks 'is_duplicate': True, 'duplicate': True
       - Updates file_path if original file was moved or path changed
       - Associates singer_id or tags if missing
+      - Updates approved=1 if approved flag is provided
       - Returns existing record without creating duplicate entries
     
     If new:
@@ -547,6 +553,16 @@ def register_media(
                 updates.append("active = 1")
                 existing["active"] = 1
             
+            # Upgrade approval status if approved=1
+            if approved == 1 and existing.get("approved") != 1:
+                updates.append("approved = 1")
+                existing["approved"] = 1
+
+            # Ensure subtype is general_broll if registering approved broll
+            if subtype == "general_broll" and existing.get("subtype") != "general_broll":
+                updates.append("subtype = 'general_broll'")
+                existing["subtype"] = "general_broll"
+            
             # Associate singer if previously unassigned
             if singer_id and not existing.get("singer_id"):
                 updates.append("singer_id = ?")
@@ -576,9 +592,11 @@ def register_media(
         path_row = cur.fetchone()
         if path_row:
             existing = dict(path_row)
-            cur.execute("UPDATE media SET file_hash = ?, dhash = ?, active = 1 WHERE id = ?", (file_hash, dhash, existing["id"]))
+            app_val = 1 if approved == 1 else existing.get("approved", 0)
+            cur.execute("UPDATE media SET file_hash = ?, dhash = ?, active = 1, approved = ? WHERE id = ?", (file_hash, dhash, app_val, existing["id"]))
             existing["file_hash"] = file_hash
             existing["dhash"] = dhash
+            existing["approved"] = app_val
             existing["is_duplicate"] = True
             existing["duplicate"] = True
             return existing
@@ -588,12 +606,12 @@ def register_media(
             INSERT INTO media (
                 singer_id, media_type, subtype, file_path, file_hash, dhash,
                 source, source_url, provider_media_id, author, license,
-                tags, description, favorite, active
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                tags, description, favorite, active, approved
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             singer_id, media_type, subtype, norm_path, file_hash, dhash,
             source, source_url, provider_media_id, author, license,
-            tags_str, description, favorite, active
+            tags_str, description, favorite, active, approved
         ))
         media_id = cur.lastrowid
 
@@ -953,6 +971,110 @@ def get_media_stats(db_path: Optional[str] = None) -> Dict[str, Any]:
 get_db_stats = get_media_stats
 
 
+def get_broll_clips_by_category(
+    category: Optional[str] = None,
+    approved_only: bool = True,
+    limit: int = 50,
+    db_path: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """
+    Queries B-roll clips from media table, optimized for category lookup and approval status.
+    
+    Args:
+        category: Optional category name to filter by (e.g. 'audience', 'hospital', etc.)
+        approved_only: If True, only returns clips with approved = 1 (or source in ('user_approved', 'user_curated'))
+        limit: Max number of clips to return
+        db_path: Optional SQLite DB path
+        
+    Returns:
+        List[Dict[str, Any]]: List of media record dicts whose physical files exist on disk.
+    """
+    with get_db_connection(db_path) as conn:
+        cur = conn.cursor()
+        
+        where_clauses = ["m.active = 1", "(m.subtype = 'general_broll' OR m.media_type = 'video')"]
+        params: List[Any] = []
+        
+        if approved_only:
+            where_clauses.append("(m.approved = 1 OR m.favorite = 1 OR m.source IN ('user_approved', 'user_curated'))")
+            
+        if category and str(category).strip():
+            norm_cat = str(category).strip().lower()
+            sql = f"""
+                SELECT DISTINCT m.*
+                FROM media m
+                JOIN media_tags mt ON m.id = mt.media_id
+                WHERE {' AND '.join(where_clauses)}
+                  AND mt.tag = ?
+                ORDER BY m.use_count ASC, m.last_used_at ASC, m.favorite DESC, m.id DESC
+                LIMIT ?
+            """
+            params.extend([norm_cat, limit])
+        else:
+            sql = f"""
+                SELECT m.*
+                FROM media m
+                WHERE {' AND '.join(where_clauses)}
+                ORDER BY m.use_count ASC, m.last_used_at ASC, m.favorite DESC, m.id DESC
+                LIMIT ?
+            """
+            params.append(limit)
+            
+        cur.execute(sql, tuple(params))
+        rows = cur.fetchall()
+        
+        results: List[Dict[str, Any]] = []
+        inactive_ids: List[int] = []
+        
+        for r in rows:
+            d = dict(r)
+            fpath = d.get("file_path")
+            if fpath and os.path.isfile(fpath):
+                results.append(d)
+            elif d.get("id"):
+                inactive_ids.append(d["id"])
+                
+        if inactive_ids:
+            cur.executemany("UPDATE media SET active = 0 WHERE id = ?", [(i,) for i in inactive_ids])
+            
+        return results
+
+
+def register_approved_broll(
+    file_path: str,
+    category: str,
+    tags: Optional[Union[List[str], str]] = None,
+    description: Optional[str] = None,
+    source: str = "user_approved",
+    db_path: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Registers a B-roll clip with user approval status (approved=1, subtype='general_broll', active=1).
+    Performs SHA-256 deduplication. If duplicate exists, updates approved=1 and returns record.
+    """
+    norm_cat = str(category).strip().lower() if category else "general"
+    tag_list = [norm_cat, "general_broll", "approved"]
+    if tags:
+        if isinstance(tags, (list, set, tuple)):
+            tag_list.extend([str(t).strip().lower() for t in tags if str(t).strip()])
+        elif isinstance(tags, str):
+            tag_list.extend([t.strip().lower() for t in tags.replace(";", ",").split(",") if t.strip()])
+    tag_list = list(dict.fromkeys(tag_list))
+
+    return register_media(
+        file_path=file_path,
+        media_type="video",
+        subtype="general_broll",
+        source=source,
+        tags=tag_list,
+        description=description or f"User approved B-roll for category '{norm_cat}'",
+        favorite=1,
+        active=1,
+        approved=1,
+        db_path=db_path
+    )
+
+
 def query_brolls(
     tags: Optional[List[str]] = None,
     limit: int = 10,
@@ -1274,6 +1396,16 @@ def delete_media_record(
             except Exception as e:
                 logger.warning(f"Could not remove file {m_path} from disk: {e}")
         return True
+
+
+def delete_broll_by_id(media_id: int, db_path: Optional[str] = None) -> bool:
+    """Deletes a B-roll media record by ID from SQLite DB and removes physical file from disk."""
+    return delete_media_record(target=int(media_id), db_path=db_path)
+
+
+def delete_broll_by_path(file_path: str, db_path: Optional[str] = None) -> bool:
+    """Deletes a B-roll media record by file_path from SQLite DB and removes physical file from disk."""
+    return delete_media_record(target=file_path, db_path=db_path)
 
 
 if __name__ == "__main__":

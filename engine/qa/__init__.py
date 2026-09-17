@@ -25,6 +25,8 @@ from engine.qa.frame_extractor import (
 )
 from engine.qa.ai_reviewer import (
     review_with_ai,
+    resolve_gemini_key,
+    resolve_all_gemini_keys,
     get_gemini_api_key,
     FALLBACK_RESULT
 )
@@ -52,6 +54,8 @@ __all__ = [
     "get_video_duration",
     "get_ffmpeg_exe",
     "review_with_ai",
+    "resolve_gemini_key",
+    "resolve_all_gemini_keys",
     "get_gemini_api_key",
     "FALLBACK_RESULT",
     "validate_repetition",

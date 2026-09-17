@@ -39,7 +39,7 @@ prompt = """당신은 수백만 조회수 유튜브 트로트 전문 채널('영
 
 t0 = time.time()
 res = client.models.generate_content(
-    model="gemini-3.6-flash",
+    model="gemini-2.5-flash",
     contents=prompt,
     config={"response_mime_type": "application/json"}
 )

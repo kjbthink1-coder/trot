@@ -15,7 +15,11 @@ def create_high_contrast_thumbnail(
     font_size_1: int = 76,
     font_size_2: int = 76,
     color_1: str = "#00D2FF",
-    color_2: str = "#FFF200"
+    color_2: str = "#FFF200",
+    sub_preview_text: str = None,
+    sub_font_size: int = 16,
+    sub_color: str = "#FFF000",
+    sub_margin_v: int = 45
 ) -> str:
     """
     5070 시니어 맞춤 고대비 썸네일 생성:
@@ -23,6 +27,7 @@ def create_high_contrast_thumbnail(
     - 윗줄(Line 1): 커스텀 크기 및 색상 + 두꺼운 블랙 테두리
     - 아랫줄(Line 2): 커스텀 크기 및 색상 + 두꺼운 블랙 테두리
     - 상단 안전지대(Safe Zone)에 배치하여 가수 얼굴 가림 방지
+    - 자막 세로 위치(sub_margin_v) 실시간 가상 오버레이 연동
     """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
@@ -95,8 +100,53 @@ def create_high_contrast_thumbnail(
     draw.text((x1, y1), line1, font=font1, fill=color_1, stroke_width=stroke_w1, stroke_fill="black")
     draw.text((x2, y2), line2, font=font2, fill=color_2, stroke_width=stroke_w2, stroke_fill="black")
 
+    # 영상 렌더링용 깨끗한 썸네일 원본 먼저 저장
     bg_canvas.save(output_path, quality=95)
-    return os.path.abspath(output_path)
+    final_preview_path = os.path.abspath(output_path)
+
+    # 5. 쇼츠 1줄 자막 가상 실시간 위치 오버레이 (UI 미리보기 전용)
+    if sub_preview_text:
+        try:
+            preview_canvas = bg_canvas.copy()
+            canvas_sub_size = int(sub_font_size * 3.8)
+            try:
+                sub_font = ImageFont.truetype(FONT_PATH, canvas_sub_size)
+            except Exception:
+                sub_font = ImageFont.load_default()
+
+            sub_y = int(height - (sub_margin_v * 4.8) - 100)
+            sub_y = max(350, min(height - 130, sub_y))
+
+            draw_p = ImageDraw.Draw(preview_canvas)
+            bbox_sub = draw_p.textbbox((0, 0), sub_preview_text, font=sub_font)
+            sw, sh = bbox_sub[2] - bbox_sub[0], bbox_sub[3] - bbox_sub[1]
+            sx = (width - sw) // 2
+
+            pad_x, pad_y = 26, 14
+            sub_bg_box = [
+                max(10, sx - pad_x),
+                max(0, sub_y - pad_y),
+                min(width - 10, sx + sw + pad_x),
+                min(height - 10, sub_y + sh + pad_y)
+            ]
+
+            sub_overlay = Image.new('RGBA', (width, height), (0, 0, 0, 0))
+            sub_draw = ImageDraw.Draw(sub_overlay)
+            sub_draw.rounded_rectangle(sub_bg_box, radius=14, fill=(0, 0, 0, 215))
+            preview_canvas.paste(sub_overlay, (0, 0), sub_overlay)
+
+            stroke_sub = max(3, int(canvas_sub_size * 0.08))
+            draw_p = ImageDraw.Draw(preview_canvas)
+            draw_p.text((sx, sub_y), sub_preview_text, font=sub_font, fill=sub_color, stroke_width=stroke_sub, stroke_fill="black")
+
+            base, ext = os.path.splitext(output_path)
+            preview_path = f"{base}_preview{ext}"
+            preview_canvas.save(preview_path, quality=95)
+            final_preview_path = os.path.abspath(preview_path)
+        except Exception as e_sub:
+            print(f"[SubPreview Error] {e_sub}")
+
+    return final_preview_path
 
 
 if __name__ == "__main__":
